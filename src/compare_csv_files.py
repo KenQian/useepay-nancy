@@ -32,6 +32,10 @@ def parse_args():
         default=5,
         help="Decimal places for comparing non-key numeric values (default: 5)",
     )
+    parser.add_argument(
+        "--stop-at",
+        help="Last column to compare, either Excel-style letter (e.g. AR) or header name",
+    )
     return parser.parse_args()
 
 
@@ -54,6 +58,28 @@ def resolve_key_column(fieldnames, key_col):
             return fieldname
 
     raise ValueError(f"Unable to resolve key column: {key_col}")
+
+
+def resolve_column_position(fieldnames, column_spec):
+    if not fieldnames:
+        raise ValueError("CSV file has no header row")
+
+    column_spec = column_spec.strip()
+    if not column_spec:
+        raise ValueError("Column spec cannot be blank")
+
+    upper_spec = column_spec.upper()
+    if upper_spec.isalpha():
+        col_idx = column_letter_to_index(upper_spec)
+        if col_idx < len(fieldnames):
+            return col_idx + 1
+        raise ValueError(f"Column {column_spec} is outside the CSV width ({len(fieldnames)} columns)")
+
+    for idx, fieldname in enumerate(fieldnames, start=1):
+        if fieldname == column_spec:
+            return idx
+
+    raise ValueError(f"Unable to resolve column: {column_spec}")
 
 
 def column_letter_to_index(column_letter):
@@ -79,19 +105,23 @@ def load_csv_rows(path):
     for encoding in DEFAULT_ENCODINGS:
         try:
             with open(path, "r", encoding=encoding, newline="") as handle:
-                reader = csv.DictReader(handle)
-                if reader.fieldnames is None:
+                reader = csv.reader(handle)
+                raw_fieldnames = next(reader, None)
+                if raw_fieldnames is None:
                     raise ValueError(f"{path} has no header row")
 
-                fieldnames = [field.strip() if field else "" for field in reader.fieldnames]
+                fieldnames = [field.strip() if field else "" for field in raw_fieldnames]
                 rows = []
+                width = len(fieldnames)
                 for row_number, raw_row in enumerate(reader, start=2):
-                    normalized_row = {}
-                    for field in fieldnames:
-                        value = raw_row.get(field, "")
-                        normalized_row[field] = value.strip() if value is not None else ""
-                    normalized_row["_RowNumber"] = row_number
-                    rows.append(normalized_row)
+                    values = list(raw_row[:width])
+                    if len(values) < width:
+                        values.extend([""] * (width - len(values)))
+                    normalized_values = [value.strip() if value is not None else "" for value in values]
+                    rows.append({
+                        "_RowNumber": row_number,
+                        "_Values": normalized_values,
+                    })
 
                 return fieldnames, rows
         except UnicodeDecodeError as exc:
@@ -107,11 +137,13 @@ def load_csv_rows(path):
 
 
 def build_lookup(rows, key_name, label):
+    key_position = key_name if isinstance(key_name, int) else None
     filtered_rows = []
     blank_key_count = 0
 
     for row in rows:
-        if row.get(key_name, "") == "":
+        key_value = get_row_value(row, key_position)
+        if key_value == "":
             blank_key_count += 1
             continue
         filtered_rows.append(row)
@@ -121,7 +153,7 @@ def build_lookup(rows, key_name, label):
 
     lookup = {}
     for row in filtered_rows:
-        key = row[key_name]
+        key = get_row_value(row, key_position)
         lookup.setdefault(key, row)
 
     return filtered_rows, lookup
@@ -187,20 +219,24 @@ def compare_csv_files():
     logging.info("Loading Target: %s", args.target_file)
     target_fields, target_rows = load_csv_rows(args.target_file)
 
-    source_key_name = resolve_key_column(source_fields, args.key_col)
-    target_key_name = resolve_key_column(target_fields, args.key_col)
+    source_key_position = resolve_column_position(source_fields, args.key_col)
+    target_key_position = resolve_column_position(target_fields, args.key_col)
+    source_key_name = source_fields[source_key_position - 1]
+    target_key_name = target_fields[target_key_position - 1]
+    source_stop_position = resolve_stop_position(source_fields, args.stop_at)
+    target_stop_position = resolve_stop_position(target_fields, args.stop_at)
 
-    source_rows, source_lookup = build_lookup(source_rows, source_key_name, "Source")
-    target_rows, target_lookup = build_lookup(target_rows, target_key_name, "Target")
+    source_rows, source_lookup = build_lookup(source_rows, source_key_position, "Source")
+    target_rows, target_lookup = build_lookup(target_rows, target_key_position, "Target")
 
     source_keys = set(source_lookup)
     target_keys = set(target_lookup)
 
     in_source_not_in_target = [
-        row for row in source_rows if row[source_key_name] not in target_keys
+        row for row in source_rows if get_row_value(row, source_key_position) not in target_keys
     ]
     in_target_not_in_source = [
-        row for row in target_rows if row[target_key_name] not in source_keys
+        row for row in target_rows if get_row_value(row, target_key_position) not in source_keys
     ]
 
     in_source_not_in_target_file = f"{output_prefix}InSourceNotInTarget.csv"
@@ -234,13 +270,15 @@ def compare_csv_files():
             source_key_name,
             target_key_name,
             args.decimal_places,
+            source_stop_position,
+            target_stop_position,
         )
         if not diff_values:
             continue
 
         mismatch_rows.append(
             {
-                source_key_name: source_row[source_key_name],
+                source_key_name: get_row_value(source_row, source_key_position),
                 "DiffValues": DIFF_VALUE_SEPARATOR.join(diff_values),
             }
         )
@@ -290,21 +328,27 @@ def get_row_diff_values(
     target_row,
     source_fields,
     target_fields,
-    source_key_name,
-    target_key_name,
+    source_key_position,
+    target_key_position,
     decimal_places,
+    source_stop_position=None,
+    target_stop_position=None,
 ):
     source_values = []
     for field_position, field in enumerate(source_fields, start=1):
-        if field_position == source_fields.index(source_key_name) + 1:
+        if source_stop_position is not None and field_position > source_stop_position:
+            break
+        if field_position == source_key_position:
             continue
-        source_values.append((field, source_row.get(field, ""), field_position))
+        source_values.append((field, get_row_value(source_row, field_position), field_position))
 
     target_values = []
     for field_position, field in enumerate(target_fields, start=1):
-        if field_position == target_fields.index(target_key_name) + 1:
+        if target_stop_position is not None and field_position > target_stop_position:
+            break
+        if field_position == target_key_position:
             continue
-        target_values.append((field, target_row.get(field, ""), field_position))
+        target_values.append((field, get_row_value(target_row, field_position), field_position))
 
     source_values = trim_trailing_empty_values(source_values)
     target_values = trim_trailing_empty_values(target_values)
@@ -324,6 +368,24 @@ def get_row_diff_values(
         )
 
     return diff_values
+
+
+def resolve_stop_position(fieldnames, stop_at):
+    if not stop_at:
+        return None
+
+    stop_at = stop_at.strip()
+    if not stop_at:
+        return None
+
+    return resolve_column_position(fieldnames, stop_at)
+
+
+def get_row_value(row, field_position):
+    values = row.get("_Values", [])
+    if 1 <= field_position <= len(values):
+        return values[field_position - 1]
+    return ""
 
 
 if __name__ == "__main__":
