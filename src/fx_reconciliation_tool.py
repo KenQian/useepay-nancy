@@ -30,6 +30,11 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
+READ_EXCEL_TEXT_KWARGS = {
+    'dtype': str,
+    'keep_default_na': False,
+}
+
 
 def get_source_files(directory, pattern_str):
     """Finds all files in directory matching a regex pattern, sorted."""
@@ -47,7 +52,12 @@ def file_has_header(path, header_keywords):
     a consistent positional schema regardless of whether each source file has
     a header row.
     """
-    preview_df = pd.read_excel(path, sheet_name=0, header=None, dtype=str)
+    preview_df = pd.read_excel(
+        path,
+        sheet_name=0,
+        header=None,
+        **READ_EXCEL_TEXT_KWARGS,
+    )
     if preview_df.empty:
         return False
 
@@ -61,7 +71,12 @@ def load_and_stack_files(file_paths, header_keywords):
     stacked_frames = []
 
     for path in file_paths:
-        df = pd.read_excel(path, sheet_name=0, header=None, dtype=str)
+        df = pd.read_excel(
+            path,
+            sheet_name=0,
+            header=None,
+            **READ_EXCEL_TEXT_KWARGS,
+        )
         if df.empty:
             logging.info(f"Skipping empty file: {os.path.basename(path)}")
             continue
@@ -75,7 +90,11 @@ def load_and_stack_files(file_paths, header_keywords):
         df.columns = range(df.shape[1])
 
         # Drop fully blank rows that often appear at the tail of exported xls files.
-        df = df.dropna(how='all')
+        blank_row_mask = df.apply(
+            lambda row: all(str(value).strip() == '' for value in row),
+            axis=1,
+        )
+        df = df[~blank_row_mask].reset_index(drop=True)
         if df.empty:
             logging.info(f"Skipping file with only header/blank rows: {os.path.basename(path)}")
             continue
@@ -160,7 +179,11 @@ def main():
     channel_orders_filtered = channel_orders_raw[~channel_orders_raw.iloc[:, 9].isin(['预授权申请', '预授权撤销'])]
 
     # Module B Source 2: Re-validation
-    special_orders_df = pd.read_excel(baseline_path, sheet_name='特殊的渠道订单', dtype=str)
+    special_orders_df = pd.read_excel(
+        baseline_path,
+        sheet_name='特殊的渠道订单',
+        **READ_EXCEL_TEXT_KWARGS,
+    )
     valid_from_special = pd.DataFrame()
     if not special_orders_df.empty:
         special_orders_df['Calc_AI_Key'] = special_orders_df.iloc[:, 3].fillna('') + special_orders_df.iloc[:, 4].fillna('')
@@ -192,8 +215,8 @@ def main():
 
     # Mapping Sheets
     mapping_sheets = {
-        '打款币种': pd.read_excel(wip_path, sheet_name='打款币种', dtype=str),
-        '渠道名称': pd.read_excel(wip_path, sheet_name='渠道名称', dtype=str)
+        '打款币种': pd.read_excel(wip_path, sheet_name='打款币种', **READ_EXCEL_TEXT_KWARGS),
+        '渠道名称': pd.read_excel(wip_path, sheet_name='渠道名称', **READ_EXCEL_TEXT_KWARGS)
     }
 
     # Module D & Logic Resolution
