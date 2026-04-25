@@ -233,10 +233,14 @@ def compare_csv_files():
     target_keys = set(target_lookup)
 
     in_source_not_in_target = [
-        row for row in source_rows if get_row_value(row, source_key_position) not in target_keys
+        row_to_csv_dict(row, source_fields)
+        for row in source_rows
+        if get_row_value(row, source_key_position) not in target_keys
     ]
     in_target_not_in_source = [
-        row for row in target_rows if get_row_value(row, target_key_position) not in source_keys
+        row_to_csv_dict(row, target_fields)
+        for row in target_rows
+        if get_row_value(row, target_key_position) not in source_keys
     ]
 
     in_source_not_in_target_file = f"{output_prefix}InSourceNotInTarget.csv"
@@ -386,6 +390,13 @@ def get_row_value(row, field_position):
     if 1 <= field_position <= len(values):
         return values[field_position - 1]
     return ""
+
+
+def row_to_csv_dict(row, fieldnames):
+    return {
+        fieldname: get_row_value(row, idx)
+        for idx, fieldname in enumerate(fieldnames, start=1)
+    }
 
 
 if __name__ == "__main__":

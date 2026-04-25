@@ -2,3 +2,6 @@
 .idea/
 testdata/
 __pycache__/
+*_InSourceAndInTarget.csv
+*_InSourceNotInTarget.csv
+*_InTargetNotInSource.csv

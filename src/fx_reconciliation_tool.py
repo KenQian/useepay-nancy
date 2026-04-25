@@ -284,9 +284,20 @@ def main():
         **READ_EXCEL_TEXT_KWARGS,
     )
     valid_from_special = pd.DataFrame()
+    revalidated_special_sheet_rows = []
+    revalidated_special_rows = []
     if not special_orders_df.empty:
+        special_orders_df['Worksheet_Row'] = special_orders_df.index + 2
         special_orders_df['Calc_AI_Key'] = special_orders_df.iloc[:, 3].fillna('') + special_orders_df.iloc[:, 4].fillna('')
         valid_from_special = special_orders_df[special_orders_df['Calc_AI_Key'].isin(account_statement_df['Internal_Key_R'])]
+        for _, row in valid_from_special.iterrows():
+            revalidated_special_sheet_rows.append(int(row['Worksheet_Row']))
+            revalidated_special_rows.append([
+                str(row.iloc[2]).strip(),
+                str(row.iloc[0]).strip(),
+                str(row.iloc[34]).strip(),
+                str(row['Calc_AI_Key']).strip(),
+            ])
 
     # 4. Writing to Excel
     wb = load_workbook(wip_path)
@@ -301,8 +312,8 @@ def main():
     ws_chan.delete_rows(2, ws_chan.max_row)
 
     ws_spec = wb['特殊的渠道订单']
-    if ws_spec.max_row > 1:
-        ws_spec.delete_rows(2, ws_spec.max_row)
+    for row_number in sorted(revalidated_special_sheet_rows, reverse=True):
+        ws_spec.delete_rows(row_number, 1)
     ws_payout = wb['打款币种']
     ws_a07 = wb['二级商户号映射表-A07']
 
@@ -352,6 +363,7 @@ def main():
                 ws_spec.cell(row=next_spec, column=c_idx).value = to_excel_cell_value(val)
             ws_spec.cell(row=next_spec, column=35).value = f"=D{next_spec}&E{next_spec}"
             ws_spec.cell(row=next_spec, column=36).value = f"=XLOOKUP(A{next_spec},账户流水!$R:$R,账户流水!$R:$R)"
+            ws_spec.cell(row=next_spec, column=37).value = f"=LEFTB(Y{next_spec},10)"
             special_rows_added.append([
                 next_spec,
                 get_data_row_value(data_row, 3),
@@ -426,6 +438,14 @@ def main():
             ws_acc.cell(row=r_idx, column=20).value = f"=M{r_idx}"
 
     logging.info(f"Processing finished. Exceptions: {exceptions_moved}")
+    logging.info(
+        "\n%s",
+        format_summary_table(
+            "Added back to 渠道订单 from 特殊的渠道订单",
+            ["C-交易流水号", "A-渠道订单号", "AP-通道名称", "AI-Key"],
+            revalidated_special_rows,
+        ),
+    )
     logging.info(
         "\n%s",
         format_summary_table(
