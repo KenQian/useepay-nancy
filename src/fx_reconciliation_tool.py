@@ -221,50 +221,42 @@ def get_latest_baseline(root_dir):
     return files[0]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="FX Channel Settlement Automation Tool")
-    parser.add_argument("directory", help="The root directory containing source files.")
+def discover_inputs(root):
+    latest_baseline = get_latest_baseline(root)
+    baseline_path = os.path.join(root, latest_baseline)
 
-    import sys
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr); sys.exit(1)
+    type1_files = get_source_files(root, FILE_CONFIG['type_1']['pattern'])
+    type2_files = get_source_files(root, FILE_CONFIG['type_2']['pattern'])
+    type3_files = get_source_files(root, FILE_CONFIG['type_3']['pattern'])
 
-    args = parser.parse_args()
-    root = args.directory
+    logging.info(f"Baseline: {latest_baseline}")
+    logging.info(
+        "Found %s Refund files, %s Consumption files, %s Channel Order files",
+        len(type1_files),
+        len(type2_files),
+        len(type3_files),
+    )
 
-    logging.info("Starting FX Settlement Automation...")
+    if not type1_files or not type2_files or not type3_files:
+        raise FileNotFoundError("Missing one or more required source file types (1.xls, 2.xls, or 3.xls patterns).")
 
-    # 1. File Discovery
-    try:
-        latest_baseline = get_latest_baseline(root)
-        baseline_path = os.path.join(root, latest_baseline)
+    return {
+        'baseline_path': baseline_path,
+        'type1_files': type1_files,
+        'type2_files': type2_files,
+        'type3_files': type3_files,
+    }
 
-        type1_files = get_source_files(root, FILE_CONFIG['type_1']['pattern'])
-        type2_files = get_source_files(root, FILE_CONFIG['type_2']['pattern'])
-        type3_files = get_source_files(root, FILE_CONFIG['type_3']['pattern'])
 
-        logging.info(f"Baseline: {latest_baseline}")
-        logging.info(
-            "Found %s Refund files, %s Consumption files, %s Channel Order files",
-            len(type1_files),
-            len(type2_files),
-            len(type3_files),
-        )
-
-        if not type1_files or not type2_files or not type3_files:
-            logging.error("Missing one or more required source file types (1.xls, 2.xls, or 3.xls patterns).")
-            return
-
-    except Exception as e:
-        logging.error(f"Initialization Failed: {e}"); return
-
-    # 2. Workspace Creation
+def create_wip_workbook(root, baseline_path):
     today_str = datetime.now().strftime('%Y%m%d')
     wip_filename = f"各通道需换汇情况汇总-{today_str}-wip.xlsx"
     wip_path = os.path.join(root, wip_filename)
     shutil.copy2(baseline_path, wip_path)
+    return wip_path
 
-    # 3. Data Ingestion & Stacking (Shadow Calculations)
+
+def load_source_data(type1_files, type2_files, type3_files):
     logging.info("Stacking %s Refund files for Module A...", len(type1_files))
     refunds_all = load_and_stack_files(type1_files, FILE_CONFIG['type_1']['header_keys'])
     logging.info("Stacking %s Consumption files for Module A...", len(type2_files))
@@ -277,7 +269,13 @@ def main():
     channel_orders_raw = load_and_stack_files(type3_files, FILE_CONFIG['type_3']['header_keys'])
     channel_orders_filtered = channel_orders_raw[~channel_orders_raw.iloc[:, 9].isin(['预授权申请', '预授权撤销'])]
 
-    # Module B Source 2: Re-validation
+    return {
+        'account_statement_df': account_statement_df,
+        'channel_orders_filtered': channel_orders_filtered,
+    }
+
+
+def collect_revalidated_special_rows(baseline_path, account_statement_df):
     special_orders_df = pd.read_excel(
         baseline_path,
         sheet_name='特殊的渠道订单',
@@ -286,6 +284,7 @@ def main():
     valid_from_special = pd.DataFrame()
     revalidated_special_sheet_rows = []
     revalidated_special_rows = []
+
     if not special_orders_df.empty:
         special_orders_df['Worksheet_Row'] = special_orders_df.index + 2
         special_orders_df['Calc_AI_Key'] = special_orders_df.iloc[:, 3].fillna('') + special_orders_df.iloc[:, 4].fillna('')
@@ -299,35 +298,51 @@ def main():
                 str(row['Calc_AI_Key']).strip(),
             ])
 
-    # 4. Writing to Excel
+    return {
+        'valid_from_special': valid_from_special,
+        'revalidated_special_sheet_rows': revalidated_special_sheet_rows,
+        'revalidated_special_rows': revalidated_special_rows,
+    }
+
+
+def prepare_workbook_for_write(wip_path, revalidated_special_sheet_rows):
     wb = load_workbook(wip_path)
 
-    # Update Account Statement Sheet
     ws_acc = wb['账户流水']
-    ws_acc.delete_rows(2, ws_acc.max_row) # Clear Old Data
+    ws_acc.delete_rows(2, ws_acc.max_row)
 
-    # Prepare workbook sheets used for writes and shadow lookups.
-    keys_to_remove_from_statement = set()
     ws_chan = wb['渠道订单']
     ws_chan.delete_rows(2, ws_chan.max_row)
 
     ws_spec = wb['特殊的渠道订单']
     for row_number in sorted(revalidated_special_sheet_rows, reverse=True):
         ws_spec.delete_rows(row_number, 1)
-    ws_payout = wb['打款币种']
-    ws_a07 = wb['二级商户号映射表-A07']
 
-    # Prepare the channel order payload before writing formulas to Excel.
-    # Prepare Target Data Pool
+    return {
+        'wb': wb,
+        'ws_acc': ws_acc,
+        'ws_chan': ws_chan,
+        'ws_spec': ws_spec,
+        'ws_payout': wb['打款币种'],
+        'ws_a07': wb['二级商户号映射表-A07'],
+    }
+
+
+def build_target_channel_data(channel_orders_filtered, valid_from_special):
     target_data = []
+
     for _, row in channel_orders_filtered.iterrows():
         new_row = list(row.iloc[0:4]) + list(row.iloc[5:34]) + [row.iloc[4]]
         target_data.append(new_row)
+
     if not valid_from_special.empty:
         for _, row in valid_from_special.iterrows():
             target_data.append(list(row.iloc[0:34]))
 
-    # Load mapping sheets so dependent Excel formulas can be shadow-calculated in Python.
+    return target_data
+
+
+def load_mapping_context(wip_path):
     mapping_sheets = {
         '打款币种': pd.read_excel(wip_path, sheet_name='打款币种', **READ_EXCEL_TEXT_KWARGS),
         '渠道名称': pd.read_excel(wip_path, sheet_name='渠道名称', **READ_EXCEL_TEXT_KWARGS),
@@ -335,36 +350,67 @@ def main():
         '二级商户号映射表-A07': pd.read_excel(wip_path, sheet_name='二级商户号映射表-A07', **READ_EXCEL_TEXT_KWARGS),
     }
 
-    # Build Python-side lookup maps used by the channel order resolution flow.
-    payout_lookup = build_lookup_map(mapping_sheets['打款币种'], key_col_idx=6, value_col_idx=5)
-    chan_map = build_lookup_map(mapping_sheets['渠道名称'], key_col_idx=0, value_col_idx=1)
-    a01_lookup = build_lookup_map(mapping_sheets['二级商户号映射表-A01'], key_col_idx=0, value_col_idx=1)
-    a07_lookup = build_lookup_map(mapping_sheets['二级商户号映射表-A07'], key_col_idx=0, value_col_idx=2)
-    pending_payout_keys = set()
-    pending_a07_keys = set()
-    payout_rows_added = []
-    a07_rows_added = []
-    special_rows_added = []
+    return {
+        'payout_lookup': build_lookup_map(mapping_sheets['打款币种'], key_col_idx=6, value_col_idx=5),
+        'chan_map': build_lookup_map(mapping_sheets['渠道名称'], key_col_idx=0, value_col_idx=1),
+        'a01_lookup': build_lookup_map(mapping_sheets['二级商户号映射表-A01'], key_col_idx=0, value_col_idx=1),
+        'a07_lookup': build_lookup_map(mapping_sheets['二级商户号映射表-A07'], key_col_idx=0, value_col_idx=2),
+        'pending_payout_keys': set(),
+        'pending_a07_keys': set(),
+        'payout_rows_added': [],
+        'a07_rows_added': [],
+        'special_rows_added': [],
+    }
 
-    # Resolve channel-order exceptions and maintain missing payout-currency mappings.
+
+def append_special_order_row(ws_spec, data_row, next_spec):
+    for c_idx, val in enumerate(data_row, start=1):
+        ws_spec.cell(row=next_spec, column=c_idx).value = to_excel_cell_value(val)
+    ws_spec.cell(row=next_spec, column=35).value = f"=D{next_spec}&E{next_spec}"
+    ws_spec.cell(row=next_spec, column=36).value = f"=XLOOKUP(A{next_spec},账户流水!$R:$R,账户流水!$R:$R)"
+    ws_spec.cell(row=next_spec, column=37).value = f"=LEFTB(Y{next_spec},10)"
+
+
+def write_channel_order_row(ws_chan, curr_row, data_row):
+    for c_idx, val in enumerate(data_row, start=1):
+        ws_chan.cell(row=curr_row, column=c_idx).value = to_excel_cell_value(val)
+
+    ws_chan.cell(row=curr_row, column=35).value = f"=D{curr_row}&E{curr_row}"
+    ws_chan.cell(row=curr_row, column=36).value = f"=N{curr_row}"
+    ws_chan.cell(row=curr_row, column=37).value = f'=IF(I{curr_row}="退款", -M{curr_row}*(1-0.032), M{curr_row}*(1-0.032))'
+    ws_chan.cell(row=curr_row, column=38).value = f"=XLOOKUP(AR{curr_row}, 打款币种!$G:$G, 打款币种!$F:$F)"
+    ws_chan.cell(row=curr_row, column=39).value = f"=VLOOKUP(AI{curr_row}, 账户流水!$R:$T, 2, 0)"
+    ws_chan.cell(row=curr_row, column=40).value = f"=VLOOKUP(AI{curr_row}, 账户流水!$R:$T, 3, 0)"
+    ws_chan.cell(row=curr_row, column=41).value = f"=IF(AL{curr_row}=AM{curr_row}, \"是\", \"否\")"
+    ws_chan.cell(row=curr_row, column=42).value = f"=VLOOKUP(F{curr_row}, 渠道名称!$A:$B, 2, 0)"
+
+    aq_f = (f'IF(AP{curr_row}="2号通道", XLOOKUP(AH{curr_row}, \'二级商户号映射表-A01\'!$A:$A, \'二级商户号映射表-A01\'!$B:$B), '
+            f'IF(AP{curr_row}="A07", XLOOKUP(AH{curr_row}, \'二级商户号映射表-A07\'!$A:$A, \'二级商户号映射表-A07\'!$C:$C) & AH{curr_row}, '
+            f'IF(AP{curr_row}="7号通道", AB{curr_row}, "")))')
+    ws_chan.cell(row=curr_row, column=43).value = f"={aq_f}"
+    ws_chan.cell(row=curr_row, column=44).value = f"=AP{curr_row}&AQ{curr_row}&AJ{curr_row}"
+
+
+def process_target_channel_data(target_data, account_statement_df, worksheet_handles, mapping_context):
+    keys_to_remove_from_statement = set()
     curr_row = 2
     exceptions_moved = 0
+
+    ws_chan = worksheet_handles['ws_chan']
+    ws_spec = worksheet_handles['ws_spec']
+    ws_payout = worksheet_handles['ws_payout']
+    ws_a07 = worksheet_handles['ws_a07']
 
     for data_row in target_data:
         col_f, col_d, col_e = data_row[5], data_row[3], data_row[4]
         ai_key = f"{col_d}{col_e}"
-        ap_val = str(chan_map.get(col_f, "")).strip()
+        ap_val = str(mapping_context['chan_map'].get(col_f, "")).strip()
         is_na = account_statement_df[account_statement_df['Internal_Key_R'] == ai_key].empty
 
         if is_na and ap_val.lower() not in ["paypal", "afterpay直连"]:
-            # Move unmatched channel orders into the special-order sheet for follow-up.
             next_spec = ws_spec.max_row + 1
-            for c_idx, val in enumerate(data_row, start=1):
-                ws_spec.cell(row=next_spec, column=c_idx).value = to_excel_cell_value(val)
-            ws_spec.cell(row=next_spec, column=35).value = f"=D{next_spec}&E{next_spec}"
-            ws_spec.cell(row=next_spec, column=36).value = f"=XLOOKUP(A{next_spec},账户流水!$R:$R,账户流水!$R:$R)"
-            ws_spec.cell(row=next_spec, column=37).value = f"=LEFTB(Y{next_spec},10)"
-            special_rows_added.append([
+            append_special_order_row(ws_spec, data_row, next_spec)
+            mapping_context['special_rows_added'].append([
                 next_spec,
                 get_data_row_value(data_row, 3),
                 get_data_row_value(data_row, 1),
@@ -375,69 +421,67 @@ def main():
             exceptions_moved += 1
             continue
 
-        # Shadow-calculate dependent formula values before writing the worksheet row.
         ah_value = get_data_row_value(data_row, 34)
         aj_value = get_data_row_value(data_row, 14)
         ab_value = get_data_row_value(data_row, 28)
 
-        # Add missing A07 secondary-merchant mappings so AQ can be completed manually later.
-        if ap_val == "A07" and ah_value and ah_value not in a07_lookup and ah_value not in pending_a07_keys:
+        if (
+            ap_val == "A07"
+            and ah_value
+            and ah_value not in mapping_context['a07_lookup']
+            and ah_value not in mapping_context['pending_a07_keys']
+        ):
             insert_row = append_a07_mapping_row(ws_a07, ah_value)
-            a07_lookup[ah_value] = ""
-            pending_a07_keys.add(ah_value)
-            a07_rows_added.append([insert_row, ah_value])
+            mapping_context['a07_lookup'][ah_value] = ""
+            mapping_context['pending_a07_keys'].add(ah_value)
+            mapping_context['a07_rows_added'].append([insert_row, ah_value])
 
-        aq_value = resolve_aq_value(ap_val, ah_value, ab_value, a01_lookup, a07_lookup)
+        aq_value = resolve_aq_value(
+            ap_val,
+            ah_value,
+            ab_value,
+            mapping_context['a01_lookup'],
+            mapping_context['a07_lookup'],
+        )
         ar_value = f"{ap_val}{aq_value}{aj_value}"
 
-        # Add missing payout-currency mapping rows so later workbook lookups can resolve.
-        if ap_val and aq_value and aj_value and ar_value not in payout_lookup and ar_value not in pending_payout_keys:
+        if (
+            ap_val
+            and aq_value
+            and aj_value
+            and ar_value not in mapping_context['payout_lookup']
+            and ar_value not in mapping_context['pending_payout_keys']
+        ):
             insert_row = append_payout_currency_row(ws_payout, ap_val, ah_value, aj_value)
-            payout_lookup[ar_value] = ""
-            pending_payout_keys.add(ar_value)
-            payout_rows_added.append([insert_row, ap_val, ah_value, aj_value, ar_value])
+            mapping_context['payout_lookup'][ar_value] = ""
+            mapping_context['pending_payout_keys'].add(ar_value)
+            mapping_context['payout_rows_added'].append([insert_row, ap_val, ah_value, aj_value, ar_value])
 
-        # Write the source row first, then preserve the workbook formulas for auditing.
-        # Write to Main Channel Orders
-        for c_idx, val in enumerate(data_row, start=1):
-            ws_chan.cell(row=curr_row, column=c_idx).value = to_excel_cell_value(val)
-
-        # Write the live workbook formulas used for downstream human verification.
-        ws_chan.cell(row=curr_row, column=35).value = f"=D{curr_row}&E{curr_row}"
-        ws_chan.cell(row=curr_row, column=36).value = f"=N{curr_row}"
-        ws_chan.cell(row=curr_row, column=37).value = f'=IF(I{curr_row}="退款", -M{curr_row}*(1-0.032), M{curr_row}*(1-0.032))'
-        ws_chan.cell(row=curr_row, column=38).value = f"=XLOOKUP(AR{curr_row}, 打款币种!$G:$G, 打款币种!$F:$F)"
-        ws_chan.cell(row=curr_row, column=39).value = f"=VLOOKUP(AI{curr_row}, 账户流水!$R:$T, 2, 0)"
-        ws_chan.cell(row=curr_row, column=40).value = f"=VLOOKUP(AI{curr_row}, 账户流水!$R:$T, 3, 0)"
-        ws_chan.cell(row=curr_row, column=41).value = f"=IF(AL{curr_row}=AM{curr_row}, \"是\", \"否\")"
-        ws_chan.cell(row=curr_row, column=42).value = f"=VLOOKUP(F{curr_row}, 渠道名称!$A:$B, 2, 0)"
-
-        aq_f = (f'IF(AP{curr_row}="2号通道", XLOOKUP(AH{curr_row}, \'二级商户号映射表-A01\'!$A:$A, \'二级商户号映射表-A01\'!$B:$B), '
-                f'IF(AP{curr_row}="A07", XLOOKUP(AH{curr_row}, \'二级商户号映射表-A07\'!$A:$A, \'二级商户号映射表-A07\'!$C:$C) & AH{curr_row}, '
-                f'IF(AP{curr_row}="7号通道", AB{curr_row}, "")))')
-        ws_chan.cell(row=curr_row, column=43).value = f"={aq_f}"
-        ws_chan.cell(row=curr_row, column=44).value = f"=AP{curr_row}&AQ{curr_row}&AJ{curr_row}"
+        write_channel_order_row(ws_chan, curr_row, data_row)
         curr_row += 1
 
-    # Remove statement rows that were pushed into the special-order sheet.
-    # Apply Cleanup & Final Statement Write
-    if keys_to_remove_from_statement:
-        account_statement_df = account_statement_df[~account_statement_df['Internal_Key_R'].isin(keys_to_remove_from_statement)]
+    return {
+        'keys_to_remove_from_statement': keys_to_remove_from_statement,
+        'exceptions_moved': exceptions_moved,
+        'payout_rows_added': mapping_context['payout_rows_added'],
+        'a07_rows_added': mapping_context['a07_rows_added'],
+        'special_rows_added': mapping_context['special_rows_added'],
+    }
 
-    # Rewrite the account statement with formulas only where there is actual source data.
+
+def write_account_statement_sheet(ws_acc, account_statement_df):
     for r_idx, row in enumerate(account_statement_df.values, start=2):
-        # Only write the row and formula if the first few columns aren't empty
         if pd.notna(row[0]) and str(row[0]).strip() != "":
             for c_idx, value in enumerate(row[:-1], start=1):
                 ws_acc.cell(row=r_idx, column=c_idx).value = to_excel_cell_value(value)
 
-            # Only apply formula if there is data to calculate
             ws_acc.cell(row=r_idx, column=13).value = f"=K{r_idx}-L{r_idx}"
             ws_acc.cell(row=r_idx, column=18).value = f"=B{r_idx}&E{r_idx}"
             ws_acc.cell(row=r_idx, column=19).value = f"=G{r_idx}"
             ws_acc.cell(row=r_idx, column=20).value = f"=M{r_idx}"
 
-    logging.info(f"Processing finished. Exceptions: {exceptions_moved}")
+
+def log_summary_tables(revalidated_special_rows, a07_rows_added, payout_rows_added, special_rows_added, ws_a07, ws_payout):
     logging.info(
         "\n%s",
         format_summary_table(
@@ -479,11 +523,95 @@ def main():
             special_rows_added,
         ),
     )
+
+
+def finalize_workbook(wb, wip_path):
     wb.save(wip_path)
     final_path = wip_path.replace("-wip.xlsx", ".xlsx")
-    if os.path.exists(final_path): os.remove(final_path)
+    if os.path.exists(final_path):
+        os.remove(final_path)
     os.rename(wip_path, final_path)
     logging.info(f"COMPLETED. File: {final_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FX Channel Settlement Automation Tool")
+    parser.add_argument("directory", help="The root directory containing source files.")
+
+    import sys
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr); sys.exit(1)
+
+    args = parser.parse_args()
+    root = args.directory
+
+    logging.info("Starting FX Settlement Automation...")
+
+    # 1. File Discovery
+    try:
+        input_paths = discover_inputs(root)
+    except Exception as e:
+        logging.error(f"Initialization Failed: {e}"); return
+
+    # 2. Workspace Creation
+    wip_path = create_wip_workbook(root, input_paths['baseline_path'])
+
+    # 3. Data Ingestion & Stacking (Shadow Calculations)
+    source_data = load_source_data(
+        input_paths['type1_files'],
+        input_paths['type2_files'],
+        input_paths['type3_files'],
+    )
+    account_statement_df = source_data['account_statement_df']
+    channel_orders_filtered = source_data['channel_orders_filtered']
+
+    # Module B Source 2: Re-validation
+    special_row_data = collect_revalidated_special_rows(input_paths['baseline_path'], account_statement_df)
+    valid_from_special = special_row_data['valid_from_special']
+    revalidated_special_rows = special_row_data['revalidated_special_rows']
+
+    # 4. Writing to Excel
+    workbook_state = prepare_workbook_for_write(
+        wip_path,
+        special_row_data['revalidated_special_sheet_rows'],
+    )
+    wb = workbook_state['wb']
+    ws_acc = workbook_state['ws_acc']
+
+    # Prepare the channel order payload before writing formulas to Excel.
+    target_data = build_target_channel_data(channel_orders_filtered, valid_from_special)
+
+    # Load mapping sheets so dependent Excel formulas can be shadow-calculated in Python.
+    mapping_context = load_mapping_context(wip_path)
+
+    # Resolve channel-order exceptions and maintain missing payout-currency mappings.
+    processing_results = process_target_channel_data(
+        target_data,
+        account_statement_df,
+        workbook_state,
+        mapping_context,
+    )
+
+    # Remove statement rows that were pushed into the special-order sheet.
+    # Apply Cleanup & Final Statement Write
+    if processing_results['keys_to_remove_from_statement']:
+        account_statement_df = account_statement_df[
+            ~account_statement_df['Internal_Key_R'].isin(processing_results['keys_to_remove_from_statement'])
+        ]
+
+    # Rewrite the account statement with formulas only where there is actual source data.
+    write_account_statement_sheet(ws_acc, account_statement_df)
+
+    logging.info(f"Processing finished. Exceptions: {processing_results['exceptions_moved']}")
+    log_summary_tables(
+        revalidated_special_rows,
+        processing_results['a07_rows_added'],
+        processing_results['payout_rows_added'],
+        processing_results['special_rows_added'],
+        workbook_state['ws_a07'],
+        workbook_state['ws_payout'],
+    )
+    finalize_workbook(wb, wip_path)
 
 
 if __name__ == "__main__":
