@@ -12,6 +12,7 @@ import argparse
 import shutil
 import logging
 import re
+import time
 import pandas as pd
 from datetime import datetime
 from openpyxl import load_workbook
@@ -34,6 +35,12 @@ READ_EXCEL_TEXT_KWARGS = {
     'dtype': str,
     'keep_default_na': False,
 }
+SUMMARY_SHEET_NAME = '处理摘要'
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+DATE_FORMAT = '%H:%M:%S'
+SPECIAL_ORDER_DROP_PREFIXES = [
+    'Delligent DE',
+]
 
 
 def get_source_files(directory, pattern_str):
@@ -163,6 +170,10 @@ def get_data_row_value(data_row, column_index):
     return ""
 
 
+def should_drop_special_order(ah_value):
+    return any(ah_value.startswith(prefix) for prefix in SPECIAL_ORDER_DROP_PREFIXES)
+
+
 def resolve_aq_value(ap_value, ah_value, ab_value, a01_lookup, a07_lookup):
     if ap_value == "2号通道":
         return a01_lookup.get(ah_value, "")
@@ -221,6 +232,28 @@ def get_latest_baseline(root_dir):
     return files[0]
 
 
+def ensure_result_dir(root):
+    result_dir = os.path.join(root, 'result')
+    os.makedirs(result_dir, exist_ok=True)
+    return result_dir
+
+
+def configure_run_logging(log_path):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    for handler in list(logger.handlers):
+        if getattr(handler, '_fx_tool_file_handler', False):
+            logger.removeHandler(handler)
+            handler.close()
+
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+    file_handler._fx_tool_file_handler = True
+    logger.addHandler(file_handler)
+
+
 def discover_inputs(root):
     latest_baseline = get_latest_baseline(root)
     baseline_path = os.path.join(root, latest_baseline)
@@ -249,9 +282,10 @@ def discover_inputs(root):
 
 
 def create_wip_workbook(root, baseline_path):
+    result_dir = ensure_result_dir(root)
     today_str = datetime.now().strftime('%Y%m%d')
     wip_filename = f"各通道需换汇情况汇总-{today_str}-wip.xlsx"
-    wip_path = os.path.join(root, wip_filename)
+    wip_path = os.path.join(result_dir, wip_filename)
     shutil.copy2(baseline_path, wip_path)
     return wip_path
 
@@ -395,19 +429,37 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
     keys_to_remove_from_statement = set()
     curr_row = 2
     exceptions_moved = 0
+    dropped_special_rows_count = 0
+    loop_start = time.perf_counter()
+    account_statement_keys = set(account_statement_df['Internal_Key_R'])
 
     ws_chan = worksheet_handles['ws_chan']
     ws_spec = worksheet_handles['ws_spec']
     ws_payout = worksheet_handles['ws_payout']
     ws_a07 = worksheet_handles['ws_a07']
 
-    for data_row in target_data:
+    total_rows = len(target_data)
+    for idx, data_row in enumerate(target_data, start=1):
+        if idx == 1 or idx % 5000 == 0 or idx == total_rows:
+            logging.info(
+                "Processing 渠道订单 rows: %s/%s elapsed=%.1fs",
+                idx,
+                total_rows,
+                time.perf_counter() - loop_start,
+            )
         col_f, col_d, col_e = data_row[5], data_row[3], data_row[4]
         ai_key = f"{col_d}{col_e}"
         ap_val = str(mapping_context['chan_map'].get(col_f, "")).strip()
-        is_na = account_statement_df[account_statement_df['Internal_Key_R'] == ai_key].empty
+        is_na = ai_key not in account_statement_keys
 
         if is_na and ap_val.lower() not in ["paypal", "afterpay直连"]:
+            ah_value = get_data_row_value(data_row, 34)
+            if should_drop_special_order(ah_value):
+                keys_to_remove_from_statement.add(ai_key)
+                exceptions_moved += 1
+                dropped_special_rows_count += 1
+                continue
+
             next_spec = ws_spec.max_row + 1
             append_special_order_row(ws_spec, data_row, next_spec)
             mapping_context['special_rows_added'].append([
@@ -463,6 +515,7 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
     return {
         'keys_to_remove_from_statement': keys_to_remove_from_statement,
         'exceptions_moved': exceptions_moved,
+        'dropped_special_rows_count': dropped_special_rows_count,
         'payout_rows_added': mapping_context['payout_rows_added'],
         'a07_rows_added': mapping_context['a07_rows_added'],
         'special_rows_added': mapping_context['special_rows_added'],
@@ -470,7 +523,17 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
 
 
 def write_account_statement_sheet(ws_acc, account_statement_df):
-    for r_idx, row in enumerate(account_statement_df.values, start=2):
+    loop_start = time.perf_counter()
+    total_rows = len(account_statement_df.index)
+    for idx, row in enumerate(account_statement_df.values, start=1):
+        if idx == 1 or idx % 5000 == 0 or idx == total_rows:
+            logging.info(
+                "Writing 账户流水 rows: %s/%s elapsed=%.1fs",
+                idx,
+                total_rows,
+                time.perf_counter() - loop_start,
+            )
+        r_idx = idx + 1
         if pd.notna(row[0]) and str(row[0]).strip() != "":
             for c_idx, value in enumerate(row[:-1], start=1):
                 ws_acc.cell(row=r_idx, column=c_idx).value = to_excel_cell_value(value)
@@ -481,7 +544,8 @@ def write_account_statement_sheet(ws_acc, account_statement_df):
             ws_acc.cell(row=r_idx, column=20).value = f"=M{r_idx}"
 
 
-def log_summary_tables(revalidated_special_rows, a07_rows_added, payout_rows_added, special_rows_added, ws_a07, ws_payout):
+def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, special_rows_added, ws_a07, ws_payout):
+    logging.info("Dropped rows while moving to 特殊的渠道订单 (AH starts with Delligent DE): %s", dropped_special_rows_count)
     logging.info(
         "\n%s",
         format_summary_table(
@@ -525,13 +589,207 @@ def log_summary_tables(revalidated_special_rows, a07_rows_added, payout_rows_add
     )
 
 
+def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, special_rows_added):
+    if SUMMARY_SHEET_NAME in wb.sheetnames:
+        ws_summary = wb[SUMMARY_SHEET_NAME]
+        ws_summary.delete_rows(1, ws_summary.max_row)
+    else:
+        channel_order_index = wb.sheetnames.index('渠道订单')
+        ws_summary = wb.create_sheet(SUMMARY_SHEET_NAME, channel_order_index)
+
+    summary_tables = [
+        (
+            "Added back to 渠道订单 from 特殊的渠道订单",
+            ["C-交易流水号", "A-渠道订单号", "AP-通道名称", "AI-Key"],
+            revalidated_special_rows,
+        ),
+        (
+            "Added rows in 二级商户号映射表-A07",
+            ["Row", "A-二级商户号"],
+            a07_rows_added,
+        ),
+        (
+            "Added rows in 打款币种",
+            ["Row", "B-通道名称", "D-二级商户号", "E-交易币种", "G-Column 7"],
+            payout_rows_added,
+        ),
+        (
+            "Added rows in 特殊的渠道订单",
+            ["Row", "C-交易流水号", "A-渠道订单号", "AP-通道名称", "AI-Key"],
+            special_rows_added,
+        ),
+    ]
+
+    current_row = 1
+    ws_summary.cell(row=current_row, column=1).value = "处理摘要"
+    current_row += 2
+
+    metadata_rows = [
+        ("运行时间", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+        ("源文件夹", source_root),
+        ("输出文件", final_path),
+        ("日志文件", log_path),
+        ("回补到渠道订单", len(revalidated_special_rows)),
+        ("丢弃的 Delligent DE 特殊订单", dropped_special_rows_count),
+        ("新增二级商户号映射表-A07", len(a07_rows_added)),
+        ("新增打款币种", len(payout_rows_added)),
+        ("新增特殊的渠道订单", len(special_rows_added)),
+    ]
+
+    for label, value in metadata_rows:
+        ws_summary.cell(row=current_row, column=1).value = label
+        ws_summary.cell(row=current_row, column=2).value = value
+        current_row += 1
+
+    current_row += 1
+
+    for title, headers, rows in summary_tables:
+        ws_summary.cell(row=current_row, column=1).value = title
+        current_row += 1
+
+        for col_idx, header in enumerate(headers, start=1):
+            ws_summary.cell(row=current_row, column=col_idx).value = header
+        current_row += 1
+
+        if rows:
+            for row in rows:
+                for col_idx, value in enumerate(row, start=1):
+                    ws_summary.cell(row=current_row, column=col_idx).value = value
+                current_row += 1
+        else:
+            ws_summary.cell(row=current_row, column=1).value = "(no records)"
+            current_row += 1
+
+        current_row += 1
+
+
 def finalize_workbook(wb, wip_path):
-    wb.save(wip_path)
+    save_start = time.perf_counter()
+    logging.info("Saving workbook to WIP path...")
     final_path = wip_path.replace("-wip.xlsx", ".xlsx")
+    wb.save(wip_path)
+    logging.info("Workbook save completed in %.1fs", time.perf_counter() - save_start)
+    rename_start = time.perf_counter()
     if os.path.exists(final_path):
         os.remove(final_path)
     os.rename(wip_path, final_path)
+    logging.info("Workbook rename completed in %.1fs", time.perf_counter() - rename_start)
     logging.info(f"COMPLETED. File: {final_path}")
+    return final_path
+
+
+def run_fx_reconciliation(root, log_path=None):
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"Source folder not found: {root}")
+
+    result_dir = ensure_result_dir(root)
+    if log_path is None:
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        log_path = os.path.join(result_dir, f'fx_reconciliation_{timestamp}.log')
+
+    configure_run_logging(log_path)
+    logging.info("Starting FX Settlement Automation...")
+    run_start = time.perf_counter()
+
+    phase_start = time.perf_counter()
+    input_paths = discover_inputs(root)
+    logging.info("Phase complete: discover_inputs elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    wip_path = create_wip_workbook(root, input_paths['baseline_path'])
+    logging.info("Phase complete: create_wip_workbook elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    source_data = load_source_data(
+        input_paths['type1_files'],
+        input_paths['type2_files'],
+        input_paths['type3_files'],
+    )
+    account_statement_df = source_data['account_statement_df']
+    channel_orders_filtered = source_data['channel_orders_filtered']
+    logging.info("Phase complete: load_source_data elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    special_row_data = collect_revalidated_special_rows(input_paths['baseline_path'], account_statement_df)
+    valid_from_special = special_row_data['valid_from_special']
+    revalidated_special_rows = special_row_data['revalidated_special_rows']
+    logging.info("Phase complete: collect_revalidated_special_rows elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    workbook_state = prepare_workbook_for_write(
+        wip_path,
+        special_row_data['revalidated_special_sheet_rows'],
+    )
+    wb = workbook_state['wb']
+    ws_acc = workbook_state['ws_acc']
+    logging.info("Phase complete: prepare_workbook_for_write elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    target_data = build_target_channel_data(channel_orders_filtered, valid_from_special)
+    logging.info("Phase complete: build_target_channel_data elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    mapping_context = load_mapping_context(wip_path)
+    logging.info("Phase complete: load_mapping_context elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    processing_results = process_target_channel_data(
+        target_data,
+        account_statement_df,
+        workbook_state,
+        mapping_context,
+    )
+    logging.info("Phase complete: process_target_channel_data elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    if processing_results['keys_to_remove_from_statement']:
+        account_statement_df = account_statement_df[
+            ~account_statement_df['Internal_Key_R'].isin(processing_results['keys_to_remove_from_statement'])
+        ]
+
+    phase_start = time.perf_counter()
+    write_account_statement_sheet(ws_acc, account_statement_df)
+    logging.info("Phase complete: write_account_statement_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    logging.info(f"Processing finished. Exceptions: {processing_results['exceptions_moved']}")
+    phase_start = time.perf_counter()
+    log_summary_tables(
+        revalidated_special_rows,
+        processing_results['dropped_special_rows_count'],
+        processing_results['a07_rows_added'],
+        processing_results['payout_rows_added'],
+        processing_results['special_rows_added'],
+        workbook_state['ws_a07'],
+        workbook_state['ws_payout'],
+    )
+    logging.info("Phase complete: log_summary_tables elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    write_summary_sheet(
+        wb,
+        root,
+        wip_path.replace("-wip.xlsx", ".xlsx"),
+        log_path,
+        revalidated_special_rows,
+        processing_results['dropped_special_rows_count'],
+        processing_results['a07_rows_added'],
+        processing_results['payout_rows_added'],
+        processing_results['special_rows_added'],
+    )
+    logging.info("Phase complete: write_summary_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    final_path = finalize_workbook(wb, wip_path)
+    logging.info("Phase complete: finalize_workbook elapsed=%.1fs", time.perf_counter() - phase_start)
+    logging.info("Run completed in %.1fs", time.perf_counter() - run_start)
+    return {
+        'final_path': final_path,
+        'log_path': log_path,
+        'revalidated_special_rows': revalidated_special_rows,
+        'a07_rows_added': processing_results['a07_rows_added'],
+        'payout_rows_added': processing_results['payout_rows_added'],
+        'special_rows_added': processing_results['special_rows_added'],
+    }
 
 
 def main():
@@ -544,74 +802,11 @@ def main():
 
     args = parser.parse_args()
     root = args.directory
-
-    logging.info("Starting FX Settlement Automation...")
-
-    # 1. File Discovery
     try:
-        input_paths = discover_inputs(root)
+        run_fx_reconciliation(root)
     except Exception as e:
-        logging.error(f"Initialization Failed: {e}"); return
-
-    # 2. Workspace Creation
-    wip_path = create_wip_workbook(root, input_paths['baseline_path'])
-
-    # 3. Data Ingestion & Stacking (Shadow Calculations)
-    source_data = load_source_data(
-        input_paths['type1_files'],
-        input_paths['type2_files'],
-        input_paths['type3_files'],
-    )
-    account_statement_df = source_data['account_statement_df']
-    channel_orders_filtered = source_data['channel_orders_filtered']
-
-    # Module B Source 2: Re-validation
-    special_row_data = collect_revalidated_special_rows(input_paths['baseline_path'], account_statement_df)
-    valid_from_special = special_row_data['valid_from_special']
-    revalidated_special_rows = special_row_data['revalidated_special_rows']
-
-    # 4. Writing to Excel
-    workbook_state = prepare_workbook_for_write(
-        wip_path,
-        special_row_data['revalidated_special_sheet_rows'],
-    )
-    wb = workbook_state['wb']
-    ws_acc = workbook_state['ws_acc']
-
-    # Prepare the channel order payload before writing formulas to Excel.
-    target_data = build_target_channel_data(channel_orders_filtered, valid_from_special)
-
-    # Load mapping sheets so dependent Excel formulas can be shadow-calculated in Python.
-    mapping_context = load_mapping_context(wip_path)
-
-    # Resolve channel-order exceptions and maintain missing payout-currency mappings.
-    processing_results = process_target_channel_data(
-        target_data,
-        account_statement_df,
-        workbook_state,
-        mapping_context,
-    )
-
-    # Remove statement rows that were pushed into the special-order sheet.
-    # Apply Cleanup & Final Statement Write
-    if processing_results['keys_to_remove_from_statement']:
-        account_statement_df = account_statement_df[
-            ~account_statement_df['Internal_Key_R'].isin(processing_results['keys_to_remove_from_statement'])
-        ]
-
-    # Rewrite the account statement with formulas only where there is actual source data.
-    write_account_statement_sheet(ws_acc, account_statement_df)
-
-    logging.info(f"Processing finished. Exceptions: {processing_results['exceptions_moved']}")
-    log_summary_tables(
-        revalidated_special_rows,
-        processing_results['a07_rows_added'],
-        processing_results['payout_rows_added'],
-        processing_results['special_rows_added'],
-        workbook_state['ws_a07'],
-        workbook_state['ws_payout'],
-    )
-    finalize_workbook(wb, wip_path)
+        logging.error(f"Initialization Failed: {e}")
+        return
 
 
 if __name__ == "__main__":
