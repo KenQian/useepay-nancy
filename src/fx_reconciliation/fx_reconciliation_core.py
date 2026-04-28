@@ -41,6 +41,17 @@ DATE_FORMAT = '%H:%M:%S'
 SPECIAL_ORDER_DROP_PREFIXES = [
     'Delligent DE',
 ]
+FX_RATE_SOURCE_FILENAME = '基本汇率.xlsx'
+FX_RATE_TARGET_SHEET_NAME = '每日汇率(oc系统中获取）'
+FX_RATE_SOURCE_SHEET_NAME = '基本汇率'
+FX_RATE_HEADER_NAMES = {
+    '汇率来源',
+    '原币种',
+    '目标币种',
+    '现汇买入价',
+    '现汇卖出价',
+    '中间价',
+}
 
 
 def get_source_files(directory, pattern_str):
@@ -257,6 +268,7 @@ def configure_run_logging(log_path):
 def discover_inputs(root):
     latest_baseline = get_latest_baseline(root)
     baseline_path = os.path.join(root, latest_baseline)
+    fx_rate_path = os.path.join(root, FX_RATE_SOURCE_FILENAME)
 
     type1_files = get_source_files(root, FILE_CONFIG['type_1']['pattern'])
     type2_files = get_source_files(root, FILE_CONFIG['type_2']['pattern'])
@@ -272,9 +284,12 @@ def discover_inputs(root):
 
     if not type1_files or not type2_files or not type3_files:
         raise FileNotFoundError("Missing one or more required source file types (1.xls, 2.xls, or 3.xls patterns).")
+    if not os.path.isfile(fx_rate_path):
+        raise FileNotFoundError(f"Required FX rate file not found: {FX_RATE_SOURCE_FILENAME}")
 
     return {
         'baseline_path': baseline_path,
+        'fx_rate_path': fx_rate_path,
         'type1_files': type1_files,
         'type2_files': type2_files,
         'type3_files': type3_files,
@@ -360,6 +375,65 @@ def prepare_workbook_for_write(wip_path, revalidated_special_sheet_rows):
         'ws_payout': wb['打款币种'],
         'ws_a07': wb['二级商户号映射表-A07'],
     }
+
+
+def resolve_fx_rate_source_sheet(wb):
+    if FX_RATE_SOURCE_SHEET_NAME in wb.sheetnames:
+        return wb[FX_RATE_SOURCE_SHEET_NAME]
+    if len(wb.sheetnames) == 1:
+        return wb[wb.sheetnames[0]]
+    raise ValueError(
+        f"{FX_RATE_SOURCE_FILENAME} must contain sheet '{FX_RATE_SOURCE_SHEET_NAME}' "
+        "or have exactly one sheet."
+    )
+
+
+def fx_rate_source_has_header(ws):
+    first_row_values = []
+    for row in ws.iter_rows(min_row=1, max_row=1, min_col=1, max_col=8, values_only=True):
+        first_row_values = [str(value).strip() for value in row if value is not None]
+    return any(value in FX_RATE_HEADER_NAMES for value in first_row_values)
+
+
+def refresh_daily_fx_rate_sheet(wb, fx_rate_path):
+    if FX_RATE_TARGET_SHEET_NAME not in wb.sheetnames:
+        raise KeyError(f"Target sheet not found in workbook: {FX_RATE_TARGET_SHEET_NAME}")
+
+    target_ws = wb[FX_RATE_TARGET_SHEET_NAME]
+    if target_ws.max_row > 1:
+        target_ws.delete_rows(2, target_ws.max_row - 1)
+
+    source_wb = load_workbook(fx_rate_path, data_only=False)
+    try:
+        source_ws = resolve_fx_rate_source_sheet(source_wb)
+        has_header = fx_rate_source_has_header(source_ws)
+        start_row = 2 if has_header else 1
+        target_row = 2
+        imported_rows = 0
+
+        logging.info(
+            "Resolved FX rate source sheet: workbook=%s sheet=%s",
+            os.path.basename(fx_rate_path),
+            source_ws.title,
+        )
+
+        for row in source_ws.iter_rows(min_row=start_row, min_col=1, max_col=8, values_only=True):
+            if all(value is None or str(value).strip() == "" for value in row):
+                continue
+            for col_idx, value in enumerate(row, start=1):
+                target_ws.cell(row=target_row, column=col_idx).value = value
+            target_ws.cell(row=target_row, column=9).value = f"=D{target_row}&E{target_row}"
+            target_row += 1
+            imported_rows += 1
+
+        logging.info(
+            "Refreshed %s with %s FX rate rows from %s",
+            FX_RATE_TARGET_SHEET_NAME,
+            imported_rows,
+            source_ws.title,
+        )
+    finally:
+        source_wb.close()
 
 
 def build_target_channel_data(channel_orders_filtered, valid_from_special):
@@ -724,6 +798,10 @@ def run_fx_reconciliation(root, log_path=None):
     wb = workbook_state['wb']
     ws_acc = workbook_state['ws_acc']
     logging.info("Phase complete: prepare_workbook_for_write elapsed=%.1fs", time.perf_counter() - phase_start)
+
+    phase_start = time.perf_counter()
+    refresh_daily_fx_rate_sheet(wb, input_paths['fx_rate_path'])
+    logging.info("Phase complete: refresh_daily_fx_rate_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
 
     phase_start = time.perf_counter()
     target_data = build_target_channel_data(channel_orders_filtered, valid_from_special)
