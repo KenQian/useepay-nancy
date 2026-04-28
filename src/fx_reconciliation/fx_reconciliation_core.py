@@ -54,6 +54,9 @@ FX_RATE_HEADER_NAMES = {
 }
 
 
+#######################################################
+#  Common Utils
+#######################################################
 def get_source_files(directory, pattern_str):
     """Finds all files in directory matching a regex pattern, sorted."""
     regex = re.compile(pattern_str, re.IGNORECASE)
@@ -103,8 +106,7 @@ def load_and_stack_files(file_paths, header_keywords):
         if has_header:
             df = df.iloc[1:].reset_index(drop=True)
 
-        # Normalize to a positional schema so mixed header/no-header source
-        # files stack cleanly.
+        # Normalize to a positional schema so mixed header/no-header source files stack cleanly.
         df.columns = range(df.shape[1])
 
         # Drop fully blank rows that often appear at the tail of exported xls files.
@@ -153,23 +155,6 @@ def find_last_non_empty_row(ws, column_index):
         if str(cell_value).strip() != "":
             return row_number
     return 1
-
-
-def append_payout_currency_row(ws_payout, ap_value, ah_value, aj_value):
-    insert_row = find_last_non_empty_row(ws_payout, 2) + 1
-
-    ws_payout.cell(row=insert_row, column=2).value = ap_value
-    ws_payout.cell(row=insert_row, column=4).value = ah_value
-    ws_payout.cell(row=insert_row, column=5).value = aj_value
-    ws_payout.cell(row=insert_row, column=7).value = f"=B{insert_row}&C{insert_row}&D{insert_row}&E{insert_row}"
-
-    return insert_row
-
-
-def append_a07_mapping_row(ws_a07, ah_value):
-    insert_row = find_last_non_empty_row(ws_a07, 1) + 1
-    ws_a07.cell(row=insert_row, column=1).value = ah_value
-    return insert_row
 
 
 def get_data_row_value(data_row, column_index):
@@ -265,6 +250,9 @@ def configure_run_logging(log_path):
     logger.addHandler(file_handler)
 
 
+#######################################################
+#  Source File Discovery and WIP Workbook Setup
+#######################################################
 def discover_inputs(root):
     latest_baseline = get_latest_baseline(root)
     baseline_path = os.path.join(root, latest_baseline)
@@ -305,6 +293,9 @@ def create_wip_workbook(root, baseline_path):
     return wip_path
 
 
+#######################################################
+#  账户流水 / 渠道订单 Source Data Loading
+#######################################################
 def load_source_data(type1_files, type2_files, type3_files):
     logging.info("Stacking %s Refund files for Module A...", len(type1_files))
     refunds_all = load_and_stack_files(type1_files, FILE_CONFIG['type_1']['header_keys'])
@@ -324,6 +315,9 @@ def load_source_data(type1_files, type2_files, type3_files):
     }
 
 
+#######################################################
+#  特殊的渠道订单 Revalidation
+#######################################################
 def collect_revalidated_special_rows(baseline_path, account_statement_df):
     special_orders_df = pd.read_excel(
         baseline_path,
@@ -354,6 +348,9 @@ def collect_revalidated_special_rows(baseline_path, account_statement_df):
     }
 
 
+#######################################################
+#  账户流水 / 渠道订单 / 特殊的渠道订单 Workbook Preparation
+#######################################################
 def prepare_workbook_for_write(wip_path, revalidated_special_sheet_rows):
     wb = load_workbook(wip_path)
 
@@ -377,6 +374,9 @@ def prepare_workbook_for_write(wip_path, revalidated_special_sheet_rows):
     }
 
 
+#######################################################
+#  每日汇率(oc系统中获取） Refresh
+#######################################################
 def resolve_fx_rate_source_sheet(wb):
     if FX_RATE_SOURCE_SHEET_NAME in wb.sheetnames:
         return wb[FX_RATE_SOURCE_SHEET_NAME]
@@ -436,6 +436,9 @@ def refresh_daily_fx_rate_sheet(wb, fx_rate_path):
         source_wb.close()
 
 
+#######################################################
+#  渠道订单 Target Data Assembly and Mapping Context
+#######################################################
 def build_target_channel_data(channel_orders_filtered, valid_from_special):
     target_data = []
 
@@ -471,6 +474,26 @@ def load_mapping_context(wip_path):
     }
 
 
+#######################################################
+#  特殊的渠道订单 / 打款币种 / 二级商户号映射表-A07 Row Appends
+#######################################################
+def append_payout_currency_row(ws_payout, ap_value, ah_value, aj_value):
+    insert_row = find_last_non_empty_row(ws_payout, 2) + 1
+
+    ws_payout.cell(row=insert_row, column=2).value = ap_value
+    ws_payout.cell(row=insert_row, column=4).value = ah_value
+    ws_payout.cell(row=insert_row, column=5).value = aj_value
+    ws_payout.cell(row=insert_row, column=7).value = f"=B{insert_row}&C{insert_row}&D{insert_row}&E{insert_row}"
+
+    return insert_row
+
+
+def append_a07_mapping_row(ws_a07, ah_value):
+    insert_row = find_last_non_empty_row(ws_a07, 1) + 1
+    ws_a07.cell(row=insert_row, column=1).value = ah_value
+    return insert_row
+
+
 def append_special_order_row(ws_spec, data_row, next_spec):
     for c_idx, val in enumerate(data_row, start=1):
         ws_spec.cell(row=next_spec, column=c_idx).value = to_excel_cell_value(val)
@@ -479,6 +502,9 @@ def append_special_order_row(ws_spec, data_row, next_spec):
     ws_spec.cell(row=next_spec, column=37).value = f"=LEFTB(Y{next_spec},10)"
 
 
+#######################################################
+#  渠道订单 Write and Processing
+#######################################################
 def write_channel_order_row(ws_chan, curr_row, data_row):
     for c_idx, val in enumerate(data_row, start=1):
         ws_chan.cell(row=curr_row, column=c_idx).value = to_excel_cell_value(val)
@@ -596,6 +622,9 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
     }
 
 
+#######################################################
+#  账户流水 Write
+#######################################################
 def write_account_statement_sheet(ws_acc, account_statement_df):
     loop_start = time.perf_counter()
     total_rows = len(account_statement_df.index)
@@ -618,6 +647,9 @@ def write_account_statement_sheet(ws_acc, account_statement_df):
             ws_acc.cell(row=r_idx, column=20).value = f"=M{r_idx}"
 
 
+#######################################################
+#  处理摘要 Logging and Sheet Output
+#######################################################
 def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, special_rows_added, ws_a07, ws_payout):
     logging.info("Dropped rows while moving to 特殊的渠道订单 (AH starts with Delligent DE): %s", dropped_special_rows_count)
     logging.info(
@@ -737,6 +769,9 @@ def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_speci
         current_row += 1
 
 
+#######################################################
+#  Workbook Finalization
+#######################################################
 def finalize_workbook(wb, wip_path):
     save_start = time.perf_counter()
     logging.info("Saving workbook to WIP path...")
@@ -752,6 +787,9 @@ def finalize_workbook(wb, wip_path):
     return final_path
 
 
+#######################################################
+#  Main Orchestration
+#######################################################
 def run_fx_reconciliation(root, log_path=None):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -766,14 +804,17 @@ def run_fx_reconciliation(root, log_path=None):
     logging.info("Starting FX Settlement Automation...")
     run_start = time.perf_counter()
 
+    # Discover the latest baseline workbook and required source files.
     phase_start = time.perf_counter()
     input_paths = discover_inputs(root)
     logging.info("Phase complete: discover_inputs elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Create the working copy workbook for this run.
     phase_start = time.perf_counter()
     wip_path = create_wip_workbook(root, input_paths['baseline_path'])
     logging.info("Phase complete: create_wip_workbook elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Load and normalize source data for 账户流水 and 渠道订单.
     phase_start = time.perf_counter()
     source_data = load_source_data(
         input_paths['type1_files'],
@@ -784,12 +825,14 @@ def run_fx_reconciliation(root, log_path=None):
     channel_orders_filtered = source_data['channel_orders_filtered']
     logging.info("Phase complete: load_source_data elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Revalidate baseline rows from 特殊的渠道订单.
     phase_start = time.perf_counter()
     special_row_data = collect_revalidated_special_rows(input_paths['baseline_path'], account_statement_df)
     valid_from_special = special_row_data['valid_from_special']
     revalidated_special_rows = special_row_data['revalidated_special_rows']
     logging.info("Phase complete: collect_revalidated_special_rows elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Prepare workbook sheets for fresh writes.
     phase_start = time.perf_counter()
     workbook_state = prepare_workbook_for_write(
         wip_path,
@@ -799,18 +842,22 @@ def run_fx_reconciliation(root, log_path=None):
     ws_acc = workbook_state['ws_acc']
     logging.info("Phase complete: prepare_workbook_for_write elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Refresh the 每日汇率(oc系统中获取） sheet from the FX source workbook.
     phase_start = time.perf_counter()
     refresh_daily_fx_rate_sheet(wb, input_paths['fx_rate_path'])
     logging.info("Phase complete: refresh_daily_fx_rate_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Build the target 渠道订单 row set.
     phase_start = time.perf_counter()
     target_data = build_target_channel_data(channel_orders_filtered, valid_from_special)
     logging.info("Phase complete: build_target_channel_data elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Load mapping context from 打款币种, 渠道名称, and mapping sheets.
     phase_start = time.perf_counter()
     mapping_context = load_mapping_context(wip_path)
     logging.info("Phase complete: load_mapping_context elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Process and write 渠道订单, including side-effect sheet updates.
     phase_start = time.perf_counter()
     processing_results = process_target_channel_data(
         target_data,
@@ -820,16 +867,20 @@ def run_fx_reconciliation(root, log_path=None):
     )
     logging.info("Phase complete: process_target_channel_data elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Remove dropped or reclassified statement rows from the 账户流水 dataset.
     if processing_results['keys_to_remove_from_statement']:
         account_statement_df = account_statement_df[
             ~account_statement_df['Internal_Key_R'].isin(processing_results['keys_to_remove_from_statement'])
         ]
 
+    # Write refreshed rows into 账户流水.
     phase_start = time.perf_counter()
     write_account_statement_sheet(ws_acc, account_statement_df)
     logging.info("Phase complete: write_account_statement_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
 
     logging.info(f"Processing finished. Exceptions: {processing_results['exceptions_moved']}")
+
+    # Log summary tables for changed sheets.
     phase_start = time.perf_counter()
     log_summary_tables(
         revalidated_special_rows,
@@ -842,6 +893,7 @@ def run_fx_reconciliation(root, log_path=None):
     )
     logging.info("Phase complete: log_summary_tables elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Write the 处理摘要 sheet.
     phase_start = time.perf_counter()
     write_summary_sheet(
         wb,
@@ -856,9 +908,11 @@ def run_fx_reconciliation(root, log_path=None):
     )
     logging.info("Phase complete: write_summary_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Save and finalize the workbook.
     phase_start = time.perf_counter()
     final_path = finalize_workbook(wb, wip_path)
     logging.info("Phase complete: finalize_workbook elapsed=%.1fs", time.perf_counter() - phase_start)
+
     logging.info("Run completed in %.1fs", time.perf_counter() - run_start)
     return {
         'final_path': final_path,
@@ -876,7 +930,8 @@ def main():
 
     import sys
     if len(sys.argv) == 1:
-        parser.print_help(sys.stderr); sys.exit(1)
+        parser.print_help(sys.stderr)
+        sys.exit(1)
 
     args = parser.parse_args()
     root = args.directory
