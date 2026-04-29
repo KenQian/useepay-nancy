@@ -79,7 +79,7 @@ Master Plan
       - Sheet 数据透视表
       - Source area: K:O produced by S2
   - Writes:
-      - Sheet 1数透结果
+      - Sheet `1数透结果`
       - Clear all rows in 1数透结果
       - Copy 数据透视表!K:O to 1数透结果!A:E, including header
       - Find the row in 1数透结果!A:E where:
@@ -130,3 +130,68 @@ Master Plan
   - Whether the yellow fill in 1数透结果 should apply to columns A:E only, or the full populated row.
   - Exact color code to use for DarkSlateBlue and Yellow, since Excel fill needs a concrete RGB/ARGB value.
 
+
+---
+We need to generate data for the sheet **`Estimated FX Summary`** (`预估换汇汇总`):
+
+### 1. Clear Existing Data
+
+* Remove all rows from the sheet except the header row.
+
+---
+
+### 2. Calculate `transactionDates` from **账户流水**
+
+* Column A in **账户流水** contains datetime values in the format:
+  `dd/MM/yyyy HH:mm:ss` (e.g., `20/04/2026 00:19:40`)
+* Extract all **unique dates** (formatted as `yyyy-MM-dd`) from Column A.
+* Sort the dates in ascending order.
+* Generate a string `transactionDates` using the following rules:
+
+  * If there is only one date → use that date directly.
+  * If there are multiple dates →
+    use the first date, then append `&dd` for each additional date.
+
+    * Example:
+      `2026-05-30, 2026-05-31, 2026-06-01` → `2026-05-30&31&01`
+
+---
+
+### 3. Copy and Transform Data from Source Sheet
+
+Copy data from **`Source` (`1数透结果`)**, columns **H:L**, into **Target** (`Estimated FX Summary`), excluding the header row.
+
+#### Column Mapping:
+
+* **Target Column A** = `transactionDates` (calculated above)
+* **Target Columns B–D** = Source Columns H–J
+* **Target Columns G–H** = Source Columns K–L
+
+---
+
+### 4. Calculated Fields
+
+* **Column E**:
+  If `B[row] == D[row]`, then `1`, otherwise:
+
+  ```
+  IF(B[row]=D[row],1,XLOOKUP(B[row]&D[row],'每日汇率(oc系统中获取）'!I:I,'每日汇率(oc系统中获取）'!H:H))
+  ```
+
+* **Column F**:
+
+  ```
+  C[row] * E[row]
+  ```
+
+* **Column I**:
+
+  ```
+  H[row] * (1 - 3%)
+  ```
+
+* **Column J**:
+
+  ```
+  D[row] & G[row]
+  ```
