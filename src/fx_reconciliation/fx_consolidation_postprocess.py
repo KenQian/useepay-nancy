@@ -12,7 +12,7 @@ import os
 from datetime import datetime, date
 
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, PatternFill
 
 
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
@@ -26,7 +26,14 @@ ESTIMATED_FX_SUMMARY_SHEET_NAME = '预估换汇汇总'
 PIVOT_TOTAL_FILL = PatternFill(fill_type='solid', fgColor='FFF2F1F7')
 PIVOT_HIGHLIGHT_FILL = PatternFill(fill_type='solid', fgColor='FFFFFF00')
 RESULT_HEADER_FILL = PatternFill(fill_type='solid', fgColor='FF00B050')
+FX_TRANSACTION_TITLE_FILL = PatternFill(fill_type='solid', fgColor='FFFFFF00')
+FX_TRANSACTION_HEADER_FILL = PatternFill(fill_type='solid', fgColor='FFF2F1F7')
+FX_TRANSACTION_NET_FILL = PatternFill(fill_type='solid', fgColor='FFD9D9D9')
+FX_TRANSACTION_NET_RESULT_FILL = PatternFill(fill_type='solid', fgColor='FFFFC7CE')
 GRAND_TOTAL_NUMBER_FORMAT = '0.00'
+ESTIMATED_FX_SUMMARY_ACCOUNTING_FORMAT = '_(* #,##0.00_);_(* (#,##0.00);_(* "-"??_);_(@_)'
+ESTIMATED_FX_SUMMARY_NUMBER_4_FORMAT = '0.0000'
+ESTIMATED_FX_SUMMARY_NUMBER_2_FORMAT = '0.00'
 SETTLEMENT_FLOW_INPUT_HEADERS = [
     '支付币种',
     '支付金额（扣除通道成本）',
@@ -171,6 +178,13 @@ def get_range_values(ws, start_row, end_row, start_col, end_col):
 
 def build_excel_formula(formula_body):
     return f"={formula_body}"
+
+
+def round_to_nearest_hundred(value):
+    numeric_value = numeric_cell_value(value)
+    if numeric_value >= 0:
+        return int((numeric_value + 50) // 100 * 100)
+    return -int((abs(numeric_value) + 50) // 100 * 100)
 
 
 def build_lookup_map_from_sheet(ws, key_col_idx, value_col_idx):
@@ -696,7 +710,11 @@ def build_daily_exchange_rate_lookup(ws_daily_exchange_rate):
             key = f"{source_currency}{target_currency}"
         if key == "":
             continue
-        exchange_rate_lookup[key] = numeric_cell_value(ws_daily_exchange_rate.cell(row=row_number, column=8).value)
+        update_first_match_lookup(
+            exchange_rate_lookup,
+            key,
+            numeric_cell_value(ws_daily_exchange_rate.cell(row=row_number, column=8).value),
+        )
 
     return exchange_rate_lookup
 
@@ -767,17 +785,26 @@ def build_estimated_fx_summary_rows(ws_settlement_flow_output, transaction_dates
 #######################################################
 #  预估换汇汇总 Publish
 #######################################################
+def apply_estimated_fx_summary_top_table_formats(ws_estimated_fx_summary, start_row, end_row):
+    for row_number in range(start_row, end_row + 1):
+        for col_number in (3, 8, 9):
+            ws_estimated_fx_summary.cell(row=row_number, column=col_number).number_format = ESTIMATED_FX_SUMMARY_ACCOUNTING_FORMAT
+        ws_estimated_fx_summary.cell(row=row_number, column=5).number_format = ESTIMATED_FX_SUMMARY_NUMBER_4_FORMAT
+        ws_estimated_fx_summary.cell(row=row_number, column=6).number_format = ESTIMATED_FX_SUMMARY_NUMBER_2_FORMAT
+
+
 def validate_estimated_fx_summary_output(ws_estimated_fx_summary, estimated_rows):
     actual_last_row = get_last_data_row(ws_estimated_fx_summary, 1, 10, min_row=2)
     actual_rows = get_range_values(ws_estimated_fx_summary, 2, actual_last_row, 1, 10) if actual_last_row >= 2 else []
+    expected_total_row_number = len(estimated_rows) + 2
 
-    if len(actual_rows) != len(estimated_rows):
+    if len(actual_rows) != len(estimated_rows) + 1:
         raise ValueError(
-            f"Estimated FX Summary validation failed: expected {len(estimated_rows)} rows, "
+            f"Estimated FX Summary validation failed: expected {len(estimated_rows) + 1} rows, "
             f"found {len(actual_rows)} rows in 预估换汇汇总."
         )
 
-    for actual_row, expected_row in zip(actual_rows, estimated_rows):
+    for actual_row, expected_row in zip(actual_rows[:-1], estimated_rows):
         expected_prefix = [
             expected_row['a_value'],
             expected_row['b_value'],
@@ -790,6 +817,32 @@ def validate_estimated_fx_summary_output(ws_estimated_fx_summary, estimated_rows
             raise ValueError("Estimated FX Summary validation failed: values in G:H do not match the computed rows.")
         if actual_row[4] != expected_row['e_formula'] or actual_row[5] != expected_row['f_formula'] or actual_row[8] != expected_row['i_formula'] or actual_row[9] != expected_row['j_formula']:
             raise ValueError("Estimated FX Summary validation failed: formulas in E/F/I/J were not preserved correctly.")
+
+    total_row = actual_rows[-1]
+    if normalize_cell_text(total_row[0]) != 'Grand Total':
+        raise ValueError("Estimated FX Summary validation failed: total row label in column A is incorrect.")
+    if total_row[2] != build_excel_formula(f"SUM(C2:C{expected_total_row_number - 1})"):
+        raise ValueError("Estimated FX Summary validation failed: total row formula in column C is incorrect.")
+    if total_row[5] != build_excel_formula(f"SUM(F2:F{expected_total_row_number - 1})"):
+        raise ValueError("Estimated FX Summary validation failed: total row formula in column F is incorrect.")
+    if total_row[7] != build_excel_formula(f"SUM(H2:H{expected_total_row_number - 1})"):
+        raise ValueError("Estimated FX Summary validation failed: total row formula in column H is incorrect.")
+    if total_row[8] != build_excel_formula(f"SUM(I2:I{expected_total_row_number - 1})"):
+        raise ValueError("Estimated FX Summary validation failed: total row formula in column I is incorrect.")
+
+    for col_number in range(1, 11):
+        cell = ws_estimated_fx_summary.cell(row=expected_total_row_number, column=col_number)
+        if cell.fill.fill_type != FX_TRANSACTION_HEADER_FILL.fill_type or cell.fill.fgColor.rgb != FX_TRANSACTION_HEADER_FILL.fgColor.rgb:
+            raise ValueError("Estimated FX Summary validation failed: total row fill was not applied correctly.")
+
+    for row_number in range(2, expected_total_row_number + 1):
+        for col_number in (3, 8, 9):
+            if ws_estimated_fx_summary.cell(row=row_number, column=col_number).number_format != ESTIMATED_FX_SUMMARY_ACCOUNTING_FORMAT:
+                raise ValueError("Estimated FX Summary validation failed: accounting format was not applied correctly.")
+        if ws_estimated_fx_summary.cell(row=row_number, column=5).number_format != ESTIMATED_FX_SUMMARY_NUMBER_4_FORMAT:
+            raise ValueError("Estimated FX Summary validation failed: number format in column E is incorrect.")
+        if ws_estimated_fx_summary.cell(row=row_number, column=6).number_format != ESTIMATED_FX_SUMMARY_NUMBER_2_FORMAT:
+            raise ValueError("Estimated FX Summary validation failed: number format in column F is incorrect.")
 
 
 def publish_estimated_fx_summary(write_wb, estimated_rows):
@@ -813,12 +866,484 @@ def publish_estimated_fx_summary(write_wb, estimated_rows):
         ws_estimated_fx_summary.cell(row=row_number, column=9).value = row_data['i_formula']
         ws_estimated_fx_summary.cell(row=row_number, column=10).value = row_data['j_formula']
 
+    total_row_number = len(estimated_rows) + 2
+    ws_estimated_fx_summary.cell(row=total_row_number, column=1).value = 'Grand Total'
+    ws_estimated_fx_summary.cell(row=total_row_number, column=3).value = build_excel_formula(f"SUM(C2:C{total_row_number - 1})")
+    ws_estimated_fx_summary.cell(row=total_row_number, column=6).value = build_excel_formula(f"SUM(F2:F{total_row_number - 1})")
+    ws_estimated_fx_summary.cell(row=total_row_number, column=8).value = build_excel_formula(f"SUM(H2:H{total_row_number - 1})")
+    ws_estimated_fx_summary.cell(row=total_row_number, column=9).value = build_excel_formula(f"SUM(I2:I{total_row_number - 1})")
+    fill_fx_transaction_row(ws_estimated_fx_summary, total_row_number, 1, 10, FX_TRANSACTION_HEADER_FILL)
+    apply_estimated_fx_summary_top_table_formats(ws_estimated_fx_summary, 2, total_row_number)
+
     validate_estimated_fx_summary_output(ws_estimated_fx_summary, estimated_rows)
     logging.info("Estimated FX Summary validated: wrote %s rows to 预估换汇汇总", len(estimated_rows))
 
     return {
         'estimated_fx_summary_rows': estimated_rows,
         'row_count': len(estimated_rows),
+    }
+
+
+#######################################################
+#  数透<日期> / 预估换汇汇总 FX Transaction Analysis
+#######################################################
+def build_fx_transaction_sheet_name(transaction_dates):
+    if normalize_cell_text(transaction_dates) == "":
+        raise ValueError("transaction_dates is required to build the FX transaction analysis sheet name.")
+
+    transformed_dates = transaction_dates.replace("yyyy-", "")
+    transformed_dates = transformed_dates[5:] if len(transformed_dates) >= 5 and transformed_dates[4] == "-" else transformed_dates
+    transformed_dates = transformed_dates.replace("-", "")
+    return f"数透{transformed_dates}"
+
+
+def recreate_fx_transaction_sheet(write_wb, transaction_dates):
+    fx_transaction_sheet_name = build_fx_transaction_sheet_name(transaction_dates)
+    if fx_transaction_sheet_name in write_wb.sheetnames:
+        write_wb.remove(write_wb[fx_transaction_sheet_name])
+    return write_wb.create_sheet(fx_transaction_sheet_name, 0)
+
+
+def apply_fx_transaction_sheet_column_widths(ws_fx_transaction):
+    ws_fx_transaction.column_dimensions['A'].width = 16
+    ws_fx_transaction.column_dimensions['B'].width = 16
+    ws_fx_transaction.column_dimensions['C'].width = 40
+    ws_fx_transaction.column_dimensions['D'].width = 25
+    ws_fx_transaction.column_dimensions['H'].width = 15
+    ws_fx_transaction.column_dimensions['I'].width = 15
+    ws_fx_transaction.column_dimensions['J'].width = 15
+    ws_fx_transaction.column_dimensions['K'].width = 15
+
+
+def write_fx_transaction_title_cell(ws, row_number, col_number, title):
+    cell = ws.cell(row=row_number, column=col_number)
+    cell.value = title
+    cell.fill = FX_TRANSACTION_TITLE_FILL
+
+
+def write_fx_transaction_header(ws, row_number, start_col, headers):
+    for col_offset, header in enumerate(headers):
+        cell = ws.cell(row=row_number, column=start_col + col_offset)
+        cell.value = header
+        cell.fill = FX_TRANSACTION_HEADER_FILL
+
+
+def write_fx_transaction_rows(ws, start_row, start_col, rows):
+    for row_offset, row_values in enumerate(rows):
+        for col_offset, value in enumerate(row_values):
+            ws.cell(row=start_row + row_offset, column=start_col + col_offset).value = to_excel_cell_value(value)
+
+
+def fill_fx_transaction_row(ws, row_number, start_col, end_col, fill):
+    for col_number in range(start_col, end_col + 1):
+        ws.cell(row=row_number, column=col_number).fill = fill
+
+
+def build_fx_transaction_table_a(estimated_rows):
+    grouped = {}
+
+    for row in estimated_rows:
+        group_key = (normalize_cell_text(row['d_value']), normalize_cell_text(row['g_value']))
+        bucket = grouped.setdefault(group_key, {'sum_f': 0.0, 'sum_i': 0.0})
+        bucket['sum_f'] += numeric_cell_value(row['f_value'])
+        bucket['sum_i'] += numeric_cell_value(row['i_value'])
+
+    grouped_rows = []
+    for group_key in sorted(grouped.keys()):
+        totals = grouped[group_key]
+        grouped_rows.append({
+            'payout_currency': group_key[0],
+            'settlement_currency': group_key[1],
+            'sum_payout_amount': totals['sum_f'],
+            'sum_settlement_amount': totals['sum_i'],
+        })
+
+    grand_total_row = {
+        'payout_currency': 'Grand Total',
+        'settlement_currency': None,
+        'sum_payout_amount': sum(row['sum_payout_amount'] for row in grouped_rows),
+        'sum_settlement_amount': sum(row['sum_settlement_amount'] for row in grouped_rows),
+    }
+    return grouped_rows, grand_total_row
+
+
+def partition_fx_transaction_netting_rows(table_a_rows):
+    row_lookup = {
+        (row['payout_currency'], row['settlement_currency']): row
+        for row in table_a_rows
+    }
+    visited_pairs = set()
+    non_netting_rows = []
+    netting_groups = []
+
+    for row in table_a_rows:
+        pair_key = (row['payout_currency'], row['settlement_currency'])
+        if pair_key in visited_pairs:
+            continue
+
+        reverse_key = (pair_key[1], pair_key[0])
+        reverse_row = row_lookup.get(reverse_key)
+        if reverse_row is None or reverse_key == pair_key:
+            non_netting_rows.append(row)
+            visited_pairs.add(pair_key)
+            continue
+
+        row_one = dict(row)
+        row_two = dict(reverse_row)
+        if row_one['sum_payout_amount'] <= row_two['sum_settlement_amount']:
+            row_one, row_two = row_two, row_one
+
+        netting_groups.append({
+            'row_one': row_one,
+            'row_two': row_two,
+        })
+        visited_pairs.add(pair_key)
+        visited_pairs.add(reverse_key)
+
+    return non_netting_rows, netting_groups
+
+
+def publish_fx_transaction_table_a(ws_fx_transaction, start_row, start_col, grouped_rows, grand_total_row):
+    headers = [
+        '打款币种',
+        '清算币种',
+        '求和项:预估通道打款金额（已扣除手续费3.2%）',
+        '求和项:清算净额（扣除收费）',
+    ]
+    write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格A')
+    write_fx_transaction_header(ws_fx_transaction, start_row + 1, start_col, headers)
+
+    data_rows = [
+        [row['payout_currency'], row['settlement_currency'], row['sum_payout_amount'], row['sum_settlement_amount']]
+        for row in grouped_rows
+    ]
+    data_rows.append([
+        grand_total_row['payout_currency'],
+        grand_total_row['settlement_currency'],
+        grand_total_row['sum_payout_amount'],
+        grand_total_row['sum_settlement_amount'],
+    ])
+    write_fx_transaction_rows(ws_fx_transaction, start_row + 2, start_col, data_rows)
+    fill_fx_transaction_row(ws_fx_transaction, start_row + 1, start_col, start_col + 3, FX_TRANSACTION_HEADER_FILL)
+    fill_fx_transaction_row(
+        ws_fx_transaction,
+        start_row + 1 + len(data_rows),
+        start_col,
+        start_col + 3,
+        FX_TRANSACTION_HEADER_FILL,
+    )
+    return {
+        'start_row': start_row,
+        'end_row': start_row + 1 + len(data_rows),
+        'rows': grouped_rows,
+        'grand_total_row': grand_total_row,
+    }
+
+
+def publish_fx_transaction_table_b(ws_fx_transaction, start_row, start_col, non_netting_rows):
+    headers = [
+        '打款币种',
+        '清算币种',
+        '求和项:预估通道打款金额（已扣除手续费3.2%）',
+        '求和项:清算净额（扣除收费）',
+    ]
+    write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格B(非轧差)')
+    write_fx_transaction_header(ws_fx_transaction, start_row + 1, start_col, headers)
+    write_fx_transaction_rows(
+        ws_fx_transaction,
+        start_row + 2,
+        start_col,
+        [[row['payout_currency'], row['settlement_currency'], row['sum_payout_amount'], row['sum_settlement_amount']] for row in non_netting_rows],
+    )
+    return {
+        'start_row': start_row,
+        'end_row': start_row + 1 + max(len(non_netting_rows), 1),
+        'rows': non_netting_rows,
+    }
+
+
+def publish_fx_transaction_table_c(ws_fx_transaction, start_row, start_col, netting_groups):
+    write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格C(轧差)')
+    current_row = start_row + 1
+    net_rows = []
+
+    for index, group in enumerate(netting_groups):
+        row_one_number = current_row
+        write_fx_transaction_rows(
+            ws_fx_transaction,
+            row_one_number,
+            start_col,
+            [[
+                group['row_one']['payout_currency'],
+                group['row_one']['settlement_currency'],
+                group['row_one']['sum_payout_amount'],
+                group['row_one']['sum_settlement_amount'],
+            ]],
+        )
+        current_row += 1
+
+        row_two_number = current_row
+        write_fx_transaction_rows(
+            ws_fx_transaction,
+            row_two_number,
+            start_col,
+            [[
+                group['row_two']['payout_currency'],
+                group['row_two']['settlement_currency'],
+                group['row_two']['sum_payout_amount'],
+                group['row_two']['sum_settlement_amount'],
+            ]],
+        )
+        current_row += 1
+
+        row_three_number = current_row
+        row_three_col3_formula = build_excel_formula(
+            f"{ws_fx_transaction.cell(row=row_one_number, column=start_col + 2).coordinate}-"
+            f"{ws_fx_transaction.cell(row=row_two_number, column=start_col + 3).coordinate}"
+        )
+        row_three_col4_formula = build_excel_formula(
+            f"{ws_fx_transaction.cell(row=row_one_number, column=start_col + 3).coordinate}-"
+            f"{ws_fx_transaction.cell(row=row_two_number, column=start_col + 2).coordinate}"
+        )
+        write_fx_transaction_rows(
+            ws_fx_transaction,
+            row_three_number,
+            start_col,
+            [[
+                group['row_one']['payout_currency'],
+                group['row_one']['settlement_currency'],
+                row_three_col3_formula,
+                row_three_col4_formula,
+            ]],
+        )
+        fill_fx_transaction_row(ws_fx_transaction, row_three_number, start_col, start_col + 3, FX_TRANSACTION_NET_FILL)
+        net_rows.append({
+            'payout_currency': group['row_one']['payout_currency'],
+            'settlement_currency': group['row_one']['settlement_currency'],
+            'sum_payout_amount': row_three_col3_formula,
+            'sum_settlement_amount': row_three_col4_formula,
+            'sum_payout_amount_value': group['row_one']['sum_payout_amount'] - group['row_two']['sum_settlement_amount'],
+            'sum_settlement_amount_value': group['row_one']['sum_settlement_amount'] - group['row_two']['sum_payout_amount'],
+            'is_net_result': True,
+        })
+        current_row += 1
+
+        if index != len(netting_groups) - 1:
+            current_row += 1
+
+    return {
+        'start_row': start_row,
+        'end_row': max(start_row + 1, current_row - 1),
+        'rows': net_rows,
+    }
+
+
+def publish_fx_transaction_table_d(ws_fx_transaction, start_row, start_col, non_netting_rows, net_rows):
+    headers = [
+        '打款币种',
+        '清算币种',
+        '求和项:预估通道打款金额（已扣除手续费3.2%）',
+        '求和项:清算净额（扣除收费）',
+    ]
+    combined_rows = [
+        dict(
+            row,
+            is_net_result=False,
+            sum_payout_amount_value=row['sum_payout_amount'],
+            sum_settlement_amount_value=row['sum_settlement_amount'],
+        )
+        for row in non_netting_rows
+    ] + [dict(row, is_net_result=True) for row in net_rows]
+    combined_rows.sort(key=lambda row: (normalize_cell_text(row['payout_currency']), normalize_cell_text(row['settlement_currency'])))
+
+    write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格D(将轧差后的数据一起汇总)')
+    write_fx_transaction_header(ws_fx_transaction, start_row + 1, start_col, headers)
+    current_row = start_row + 2
+    for row_data in combined_rows:
+        write_fx_transaction_rows(
+            ws_fx_transaction,
+            current_row,
+            start_col,
+            [[row_data['payout_currency'], row_data['settlement_currency'], row_data['sum_payout_amount'], row_data['sum_settlement_amount']]],
+        )
+        if row_data.get('is_net_result'):
+            fill_fx_transaction_row(ws_fx_transaction, current_row, start_col, start_col + 3, FX_TRANSACTION_NET_RESULT_FILL)
+        current_row += 1
+
+    return {
+        'start_row': start_row,
+        'end_row': start_row + 1 + max(len(combined_rows), 1),
+        'rows': combined_rows,
+    }
+
+
+def publish_fx_transaction_table_e(ws_fx_transaction, start_row, start_col, table_d_rows):
+    headers = ['卖出币种', '卖出金额', '买入币种', '买入金额']
+    table_e_rows = [
+        {
+            'sell_currency': row['payout_currency'],
+            'sell_amount': row['sum_payout_amount'],
+            'sell_amount_value': row['sum_payout_amount_value'],
+            'buy_currency': row['settlement_currency'],
+            'buy_amount': row['sum_settlement_amount'],
+            'buy_amount_value': row['sum_settlement_amount_value'],
+        }
+        for row in table_d_rows
+    ]
+    write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格E(盯盘所需数据)')
+    write_fx_transaction_header(ws_fx_transaction, start_row + 1, start_col, headers)
+    write_fx_transaction_rows(
+        ws_fx_transaction,
+        start_row + 2,
+        start_col,
+        [[row['sell_currency'], row['sell_amount'], row['buy_currency'], row['buy_amount']] for row in table_e_rows],
+    )
+    return {
+        'start_row': start_row,
+        'end_row': start_row + 1 + max(len(table_e_rows), 1),
+        'rows': table_e_rows,
+    }
+
+
+def publish_fx_transaction_table_f(ws_fx_transaction, start_row, start_col, table_e_rows):
+    headers = ['卖出币种', '卖出金额', '买入币种']
+    write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格F(最终数据)')
+    write_fx_transaction_header(ws_fx_transaction, start_row + 1, start_col, headers)
+    table_f_rows = []
+    for row_offset, row in enumerate(table_e_rows):
+        table_e_row_number = start_row + 2 + row_offset
+        rounded_formula = build_excel_formula(f"ROUND(B{table_e_row_number},-2)")
+        rounded_value = round_to_nearest_hundred(row['sell_amount_value'])
+        table_f_rows.append({
+            'sell_currency': row['sell_currency'],
+            'sell_amount': rounded_value,
+            'sell_amount_formula': rounded_formula,
+            'buy_currency': row['buy_currency'],
+        })
+        write_fx_transaction_rows(
+            ws_fx_transaction,
+            start_row + 2 + row_offset,
+            start_col,
+            [[row['sell_currency'], rounded_formula, row['buy_currency']]],
+        )
+    return {
+        'start_row': start_row,
+        'end_row': start_row + 1 + max(len(table_f_rows), 1),
+        'rows': table_f_rows,
+    }
+
+
+def build_fx_transaction_summary_remarks(summary_rows):
+    def format_remark_amount(value):
+        numeric_value = numeric_cell_value(value)
+        if float(numeric_value).is_integer():
+            return str(int(numeric_value))
+        return str(numeric_value)
+
+    remark_parts = []
+    for row in summary_rows:
+        sell_amount = numeric_cell_value(row['sell_amount'])
+        if sell_amount == 0:
+            continue
+        if sell_amount > 0:
+            remark_parts.append(
+                f"{format_remark_amount(sell_amount)} {normalize_cell_text(row['sell_currency'])}换{normalize_cell_text(row['buy_currency'])}"
+            )
+        else:
+            remark_parts.append(
+                f"{normalize_cell_text(row['buy_currency'])}换{format_remark_amount(abs(sell_amount))} {normalize_cell_text(row['sell_currency'])}"
+            )
+    return '换汇时可以用' + '，'.join(remark_parts)
+
+
+def append_fx_transaction_summary_table(write_wb, table_f_rows):
+    ws_estimated_fx_summary = write_wb[ESTIMATED_FX_SUMMARY_SHEET_NAME]
+    summary_header_row = get_last_data_row(ws_estimated_fx_summary, 1, 10, min_row=1) + 11
+    summary_rows = [
+        {
+            'sell_currency': row['sell_currency'],
+            'sell_amount': row['sell_amount'],
+            'buy_currency': row['buy_currency'],
+            'buy_amount': None,
+        }
+        for row in table_f_rows
+    ]
+
+    write_fx_transaction_header(
+        ws_estimated_fx_summary,
+        summary_header_row,
+        1,
+        ['卖出币种', '卖出金额', '买入币种', '买入金额', '备注'],
+    )
+    write_fx_transaction_rows(
+        ws_estimated_fx_summary,
+        summary_header_row + 1,
+        1,
+        [[row['sell_currency'], row['sell_amount'], row['buy_currency'], row['buy_amount']] for row in summary_rows],
+    )
+    ws_estimated_fx_summary.merge_cells(start_row=summary_header_row, start_column=7, end_row=summary_header_row, end_column=10)
+    remarks_cell = ws_estimated_fx_summary.cell(row=summary_header_row, column=7)
+    remarks_cell.value = build_fx_transaction_summary_remarks(summary_rows)
+    remarks_cell.alignment = Alignment(wrap_text=True)
+
+    ws_estimated_fx_summary.row_dimensions[summary_header_row].height = 50
+    for col_number in range(1, 6):
+        ws_estimated_fx_summary.cell(row=summary_header_row, column=col_number).alignment = Alignment(
+            horizontal='center',
+            vertical='center',
+        )
+
+    for row_number in range(summary_header_row + 1, summary_header_row + 1 + len(summary_rows)):
+        ws_estimated_fx_summary.cell(row=row_number, column=1).alignment = Alignment(horizontal='center')
+        ws_estimated_fx_summary.cell(row=row_number, column=2).number_format = ESTIMATED_FX_SUMMARY_NUMBER_2_FORMAT
+        ws_estimated_fx_summary.cell(row=row_number, column=3).alignment = Alignment(horizontal='center')
+
+    return {
+        'summary_header_row': summary_header_row,
+        'summary_rows': summary_rows,
+    }
+
+
+def publish_fx_transaction_analysis(write_wb, transaction_dates, estimated_rows):
+    ws_fx_transaction = recreate_fx_transaction_sheet(write_wb, transaction_dates)
+    apply_fx_transaction_sheet_column_widths(ws_fx_transaction)
+    table_a_rows, table_a_grand_total = build_fx_transaction_table_a(estimated_rows)
+    non_netting_rows, netting_groups = partition_fx_transaction_netting_rows(table_a_rows)
+
+    fx_transaction_table_a = publish_fx_transaction_table_a(ws_fx_transaction, 1, 1, table_a_rows, table_a_grand_total)
+    fx_transaction_table_b = publish_fx_transaction_table_b(ws_fx_transaction, fx_transaction_table_a['end_row'] + 10, 1, non_netting_rows)
+    fx_transaction_table_c = publish_fx_transaction_table_c(ws_fx_transaction, fx_transaction_table_b['start_row'], 8, netting_groups)
+    fx_transaction_table_d = publish_fx_transaction_table_d(
+        ws_fx_transaction,
+        max(fx_transaction_table_b['end_row'], fx_transaction_table_c['end_row']) + 10,
+        1,
+        non_netting_rows,
+        fx_transaction_table_c['rows'],
+    )
+    fx_transaction_table_e = publish_fx_transaction_table_e(ws_fx_transaction, fx_transaction_table_d['end_row'] + 10, 1, fx_transaction_table_d['rows'])
+    fx_transaction_table_f = publish_fx_transaction_table_f(ws_fx_transaction, fx_transaction_table_e['start_row'], 8, fx_transaction_table_e['rows'])
+    fx_transaction_summary_table = append_fx_transaction_summary_table(write_wb, fx_transaction_table_f['rows'])
+
+    logging.info(
+        "FX transaction analysis validated: created %s with A=%s rows, B=%s rows, C=%s net groups, D=%s rows, E=%s rows, F=%s rows",
+        ws_fx_transaction.title,
+        len(fx_transaction_table_a['rows']),
+        len(fx_transaction_table_b['rows']),
+        len(netting_groups),
+        len(fx_transaction_table_d['rows']),
+        len(fx_transaction_table_e['rows']),
+        len(fx_transaction_table_f['rows']),
+    )
+
+    return {
+        'fx_transaction_sheet_name': ws_fx_transaction.title,
+        'fx_transaction_table_a': fx_transaction_table_a,
+        'fx_transaction_table_b': fx_transaction_table_b,
+        'fx_transaction_table_c': fx_transaction_table_c,
+        'fx_transaction_table_d': fx_transaction_table_d,
+        'fx_transaction_table_e': fx_transaction_table_e,
+        'fx_transaction_table_f': fx_transaction_table_f,
+        'fx_transaction_summary_table': fx_transaction_summary_table,
     }
 
 
@@ -845,6 +1370,7 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
     transaction_dates = None
     exchange_rate_lookup = {}
     estimated_fx_summary_results = {'estimated_fx_summary_rows': []}
+    fx_transaction_results = {}
 
     try:
         if CHANNEL_ORDER_SHEET_NAME not in read_wb.sheetnames:
@@ -882,7 +1408,16 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
                 exc,
             )
 
+        if transaction_dates and estimated_fx_summary_results['estimated_fx_summary_rows']:
+            # Generate the FX transaction analysis sheet and append the summary table.
+            fx_transaction_results = publish_fx_transaction_analysis(
+                write_wb,
+                transaction_dates,
+                estimated_fx_summary_results['estimated_fx_summary_rows'],
+            )
+
         # Save the updated workbook.
+        write_wb.active = write_wb.sheetnames.index(ESTIMATED_FX_SUMMARY_SHEET_NAME)
         write_wb.save(workbook_path)
         logging.info("Completed FX consolidation post-processing: %s", workbook_path)
     finally:
@@ -895,6 +1430,7 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
         'transaction_dates': transaction_dates,
         'exchange_rate_lookup': exchange_rate_lookup,
         'estimated_fx_summary_rows': estimated_fx_summary_results['estimated_fx_summary_rows'],
+        **fx_transaction_results,
     }
 
 

@@ -47,6 +47,19 @@ Develop a Python script to automate the daily Foreign Exchange (FX) reconciliati
 3. **Resolve AI:** Build account lookup key.
 4. **Perform Lookups:** Find internal values for AL, AM, and AN to drive Module D logic.
 
+| Column | Logic / Formula (Write as String Literal) |
+|:-------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **AI** | `=D[row] & E[row]` |
+| **AJ** | `=N[row]` |
+| **AK** | `=IF(I[row]="退款", -M[row]*(1-0.032), M[row]*(1-0.032))` |
+| **AL** | `=XLOOKUP(AR[row], 打款币种!$G:$G, 打款币种!$F:$F)` |
+| **AM** | `=VLOOKUP(AI[row], 账户流水!$R:$T, 2, 0)` |
+| **AN** | `=VLOOKUP(AI[row], 账户流水!$R:$T, 3, 0)` |
+| **AO** | `=IF(AL[row] = AM[row], "是", "否")` |
+| **AP** | `=VLOOKUP(F[row], 渠道名称!$A:$B, 2, 0)` |
+| **AQ** | **Nested Mapping Logic:** <br>1. If AP[row] == `2号通道`: `XLOOKUP(AH[row], '二级商户号映射表-A01'!$A:$A, '二级商户号映射表-A01'!$B:$B)` <br>2. If AP[row] == `A07`: `XLOOKUP(AH[row], '二级商户号映射表-A07'!$A:$A, '二级商户号映射表-A07'!$C:$C) & AH[row]` <br>3. If AP[row] == `7号通道`: `AB[row]` <br>4. Others: Empty string `""` |
+| **AR** | `=AP[row] & AQ[row] & AJ[row]` |
+
  
 ## 6. Module D: Post-Processing & Exception Handling
 For rows in `渠道订单` where the **internal Python lookup** for Column AM results in no match (which would manifest as `#N/A` in Excel):

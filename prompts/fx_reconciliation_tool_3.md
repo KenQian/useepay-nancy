@@ -131,7 +131,7 @@ Master Plan
   - Exact color code to use for DarkSlateBlue and Yellow, since Excel fill needs a concrete RGB/ARGB value.
 
 
----
+-----------------------------------------------------------------------------------
 We need to generate data for the sheet **`Estimated FX Summary`** (`预估换汇汇总`):
 
 ### 1. Clear Existing Data
@@ -195,3 +195,255 @@ Copy data from **`Source` (`1数透结果`)**, columns **H:L**, into **Target** 
   ```
   D[row] & G[row]
   ```
+-----------------------------------------------------------------------------------
+# Generate FX Transaction Analysis Sheets and Tables
+
+---
+
+## 1. Create a New Sheet
+- Use the existing `transaction_dates` (e.g., `2026-05-30&31&01` or `2026-05-30`)
+- Transform it by:
+  - Removing `yyyy-`
+  - Removing the `-` between `mm` and `dd`  
+  - Example:  
+    `2026-05-30&31&01` → `0530&31&01`
+- Construct the sheet name as:  
+  **`数透` + transformed date**  
+  - Example: `数透0530&31&01`
+- Insert this sheet as the **first sheet** in the workbook
+- Use `fx_transaction` as the prefix for related variables
+
+---
+
+## 2. Create Data Blocks (Tables A–F)
+
+### Common Formatting Rules
+- Fill the **top-left cell of each table area** with **yellow**
+- Fill **header rows** with color `FFF2F1F7`
+- Tail (total) rows (if any) also use `FFF2F1F7`
+
+---
+
+### 2.1 Table A (`fx_transaction_table_a`)
+**Purpose:** Pivot-style summary from `预估换汇汇总`
+
+**Input:**
+- Sheet `预估换汇汇总`
+
+**Processing:**
+- Group by columns **D and G**
+- Aggregate:
+  - Sum(E)
+  - Sum(H)
+- Sort by D, then G
+
+**Output:**
+- Location: starts from row 1
+- **Write `表格A` in the top-left cell of the table area**
+- Header:
+  - 打款币种, 清算币种, 求和项:预估通道打款金额（已扣除手续费3.2%）, 求和项:清算净额（扣除收费）
+- Mapping:
+  - D → A
+  - G → B
+  - Sum(F) → C
+  - Sum(H) → D
+- Add final row:
+  - A = `Grand Total`
+  - C = total of Column C
+  - D = total of Column D
+
+---
+
+### 2.2 Table B (`fx_transaction_table_b`)
+**Purpose:** Currency pairs that do **NOT** require netting
+
+**Input:**
+- Table A
+
+**Processing:**
+- A pair (A, B) requires netting if a reverse pair (B, A) exists
+- Otherwise, it does not require netting
+
+**Output:**
+- Position: 10 rows below Table A
+- **Write `表格B(非轧差)` in the top-left cell of the table area**
+- Header:
+  - 打款币种, 清算币种, 求和项:预估通道打款金额（已扣除手续费3.2%）, 求和项:清算净额（扣除收费）
+- Copy all rows that do not require netting
+
+---
+
+### 2.3 Table C (`fx_transaction_table_c`)
+**Purpose:** Currency pairs that **require netting**
+
+**Input:**
+- Table A
+
+**Output:**
+- Position: right of Table B (start from column H), aligned to the same row
+- **Write `表格C(轧差)` in the top-left cell of the table area**
+- No header
+
+**Processing:**
+- For each reversible pair (A,B) & (B,A):
+  - Row 1: first record
+  - Row 2: reverse record
+  - Row 3: net result:
+    - J3 = J1 − J2 > 0
+    - K3 = K1 − K2 > 0
+    - H3 = H1, I3 = I1
+  - Fill row 3 with **gray color**
+  - Insert one empty row between groups
+
+---
+
+### 2.4 Table D (`fx_transaction_table_d`)
+**Purpose:** Combine:
+- Non-netting records (Table B)
+- Netting results (Table C row 3 only)
+
+**Processing:**
+- Merge datasets
+- Sort by:
+  - First column in the merged dataset
+  - Second column in the merged dataset
+
+**Output:**
+- Position: below the lower of Table B / Table C + 10 rows
+- **Write `表格D(将轧差后的数据一起汇总)` in the top-left cell of the table area**
+- Header:
+  - 打款币种, 清算币种, 求和项:预估通道打款金额（已扣除手续费3.2%）, 求和项:清算净额（扣除收费）
+- Highlight netting result rows (from Table C) in **red**
+
+---
+
+### 2.5 Table E (`fx_transaction_table_e`)
+**Purpose:** Trade monitoring data
+
+**Input:**
+- Table D
+
+**Output:**
+- Position: 10 rows below Table D
+- **Write `表格E(盯盘所需数据)` in the top-left cell of the table area**
+- Header:
+  - 卖出币种, 卖出金额, 买入币种, 买入金额
+- Mapping:
+  - A → A
+  - C → B
+  - B → C
+  - D → D
+
+---
+
+### 2.6 Table F (`fx_transaction_table_f`)
+**Purpose:** Final monitoring dataset
+
+**Input:**
+- Table E
+
+**Output:**
+- Position: right of Table E (start from column H), aligned to the same row
+- **Write `表格F(最终数据)` in the top-left cell of the table area**
+- Header:
+  - 卖出币种, 卖出金额, 买入币种
+- Mapping:
+  - A → H
+  - B → I (**round to the nearest hundred**)
+  - C → J 
+
+---
+
+## 3. Create Summary Table in `预估换汇汇总`
+
+Create table: **`fx_transaction_summary_table`**
+
+**Input:**
+- Table F (`fx_transaction_table_f`)
+
+**Processing:**
+- Find the last row in `预估换汇汇总`
+- Insert the table after **10 empty rows**
+
+---
+
+### 3.1 Output: Summary Table
+- Header:
+  - 卖出币种, 卖出金额, 买入币种, 买入金额, 备注
+- Mapping:
+  - H → A
+  - I → B
+  - J → C
+
+---
+
+### 3.2 Generate Remarks (备注)
+- Position:
+  - On the **right side of `fx_transaction_summary_table`**', align with its header row.
+  - Merge header row columns **G–J**
+
+- Logic:
+  - Iterate through **each row in `fx_transaction_summary_table`**
+  - For each row:
+    - If `B[row] == 0` → skip
+    - If `B[row] > 0` →  
+      `用B[row]A[row]换C[row]`
+    - If `B[row] < 0` →  
+      `用C[row]换B[row]A[row]`  
+      (remove the negative sign from `B[row]`)
+
+- Final Step:
+  - Concatenate all generated strings using **Chinese comma (`，`)**
+  - **Output the final joined string into the merged cell**
+
+
+----------------------------
+## Update Formatting and Layout
+
+### 1. Update Bottom Table in `Estimated FX Summary` (`预估换汇汇总`)
+
+The sheet contains two tables:
+- Top table (from `1数透结果`)
+- Bottom table (from `Table F (fx_transaction_table_f)`)
+
+> ⚠️ Apply the following changes **only to the bottom table**
+
+#### Formatting Rules
+- **Header Row**
+  - Set row height to **50**
+  - Set alignment to:
+    - Vertical: **middle**
+    - Horizontal: **center**
+
+- **Data Rows**
+  - Columns **A and C**:
+    - Set horizontal alignment to **center**
+  - Column **B**:
+    - Format: **Number**
+    - Decimal places: **2**
+
+---
+
+### 2. Remarks Area (Right Side)
+- Enable **wrap text** for the remarks cell(s)
+
+---
+
+### 3. Update Column Widths in Sheet `数透xxx`
+
+> Apply **before creating Tables A–F**
+
+Set column widths as follows:
+- A: 16  
+- B: 16  
+- C: 40  
+- D: 25  
+- H: 15  
+- I: 15  
+- J: 15  
+- K: 15  
+
+---
+
+### 4. Set Default Active Sheet
+- Set **`预估换汇汇总`** as the active sheet at the end
