@@ -537,3 +537,54 @@ Add validation and auto-repair logic in `fx_reconciliation_core.py` to ensure al
 - Ensure all required lookup keys exist before post-processing
   - Prevent failures in `fx_consolidation_postprocess.py`
   - Improve data completeness and pipeline robustness
+
+
+----
+
+Then some fix is needed for appending records to sheets 二级商户号映射表-A07 and 打款币种. 
+
+Following is the output:
+
+--- log start ---
+20:39:29 - INFO - 
+Added back to 渠道订单 from 特殊的渠道订单
+(no records)
+20:39:29 - INFO - 
+Added rows in 二级商户号映射表-A07
+Row | A-二级商户号                          
+----+----------------------------------
+909 | MICROS-spiderfarmer.co.uk        
+910 | MICROS-jimmy.eu                  
+911 | MICROS-marshydroled.co.uk        
+912 | VTOMAN-us.gooloo.com-klarna      
+913 | SPHERE UK-pixarbikes.co.uk-klarna
+914 | Oktyple-www.sposadresses.com     
+915 | Nekoya FR-m.moonycozy.com-link   
+916 | Oktyple US-okbridal.co.uk        
+20:39:29 - INFO - 
+Added rows in 打款币种
+Row  | B-通道名称 | D-二级商户号                            | E-交易币种 | G-Column 7                                
+-----+--------+------------------------------------+--------+-------------------------------------------
+1720 | A07    | MICROS-spiderfarmer.co.uk          | GBP    | A07MICROS-spiderfarmer.co.ukGBP           
+1721 | A07    | MICROS-jimmy.eu                    | EUR    | A07MICROS-jimmy.euEUR                     
+1722 | A07    | MICROS-marshydroled.co.uk          | GBP    | A07MICROS-marshydroled.co.ukGBP           
+1723 | A07    | ZONGHENG-TapRead                   | JPY    | A07USZONGHENG-TapReadJPY                  
+1724 | A07    | VTOMAN-us.gooloo.com-klarna        | USD    | A07VTOMAN-us.gooloo.com-klarnaUSD         
+1725 | A07    | TENZHUO HK-Readink                 | UYU    | A07HKTENZHUO HK-ReadinkUYU                
+1726 | A07    | SPHERE UK-pixarbikes.co.uk-klarna  | GBP    | A07SPHERE UK-pixarbikes.co.uk-klarnaGBP   
+1727 | A07    | Oktyple-www.sposadresses.com       | USD    | A07Oktyple-www.sposadresses.comUSD        
+1728 | A07    | BABARONI-www.babaroni.co.uk-klarna | SEK    | A07GBBABARONI-www.babaroni.co.uk-klarnaSEK
+1729 | A07    | Nekoya FR-m.moonycozy.com-link     | EUR    | A07Nekoya FR-m.moonycozy.com-linkEUR      
+1730 | A07    | Oktyple US-okbridal.co.uk          | USD    | A07Oktyple US-okbridal.co.ukUSD           
+1731 | A07    | NEXTMARVEL US- www.zeelool.com     | EUR    | A07USNEXTMARVEL US- www.zeelool.comEUR    
+--- log end ---
+
+Following records should not be added because "same"(only case differences) data is already there. Following are all start with `MICROS`, however, the records in the corresponding sheet start with `Micros`. 
+
+909 | MICROS-spiderfarmer.co.uk        
+910 | MICROS-jimmy.eu                  
+911 | MICROS-marshydroled.co.uk  
+
+1720 | A07    | MICROS-spiderfarmer.co.uk          | GBP    | A07MICROS-spiderfarmer.co.ukGBP           
+1721 | A07    | MICROS-jimmy.eu                    | EUR    | A07MICROS-jimmy.euEUR                     
+1722 | A07    | MICROS-marshydroled.co.uk          | GBP    | A07MICROS-marshydroled.co.ukGBP           

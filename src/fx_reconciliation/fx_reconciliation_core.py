@@ -147,6 +147,48 @@ def build_lookup_map(df, key_col_idx=0, value_col_idx=1):
     return lookup
 
 
+def normalize_case_insensitive_key(value):
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def update_case_insensitive_lookup(lookup, raw_key, raw_value):
+    normalized_key = normalize_case_insensitive_key(raw_key)
+    if not normalized_key:
+        return
+
+    normalized_value = str(raw_value).strip() if raw_value is not None else ""
+    existing_entry = lookup.get(normalized_key)
+    if existing_entry is None or (not existing_entry['value'] and normalized_value):
+        lookup[normalized_key] = {
+            'key': str(raw_key).strip(),
+            'value': normalized_value,
+        }
+
+
+def build_case_insensitive_lookup_map(df, key_col_idx=0, value_col_idx=1):
+    lookup = {}
+    if df.empty:
+        return lookup
+
+    for _, row in df.iterrows():
+        update_case_insensitive_lookup(lookup, row.iloc[key_col_idx], row.iloc[value_col_idx])
+
+    return lookup
+
+
+def get_lookup_value(case_sensitive_lookup, case_insensitive_lookup, key):
+    direct_value = str(case_sensitive_lookup.get(key, "")).strip() if key else ""
+    if direct_value:
+        return direct_value
+
+    normalized_key = normalize_case_insensitive_key(key)
+    if normalized_key and normalized_key in case_insensitive_lookup:
+        return case_insensitive_lookup[normalized_key]['value']
+    return ""
+
+
 def find_last_non_empty_row(ws, column_index):
     for row_number in range(ws.max_row, 1, -1):
         cell_value = ws.cell(row=row_number, column=column_index).value
@@ -175,6 +217,17 @@ def resolve_aq_value(ap_value, ah_value, ab_value, a01_lookup, a07_lookup):
         return a01_lookup.get(ah_value, "")
     if ap_value == "A07":
         return f"{a07_lookup.get(ah_value, '')}{ah_value}" if ah_value else ""
+    if ap_value == "7号通道":
+        return ab_value
+    return ""
+
+
+def resolve_aq_value_with_case_insensitive_a07(ap_value, ah_value, ab_value, a01_lookup, a07_lookup, a07_lookup_ci):
+    if ap_value == "2号通道":
+        return a01_lookup.get(ah_value, "")
+    if ap_value == "A07":
+        a07_prefix = get_lookup_value(a07_lookup, a07_lookup_ci, ah_value)
+        return f"{a07_prefix}{ah_value}" if ah_value else ""
     if ap_value == "7号通道":
         return ab_value
     return ""
@@ -463,13 +516,19 @@ def load_mapping_context(wip_path):
 
     return {
         'payout_lookup': build_lookup_map(mapping_sheets['打款币种'], key_col_idx=6, value_col_idx=5),
+        'payout_lookup_ci': build_case_insensitive_lookup_map(mapping_sheets['打款币种'], key_col_idx=6, value_col_idx=5),
         'chan_map': build_lookup_map(mapping_sheets['渠道名称'], key_col_idx=0, value_col_idx=1),
         'a01_lookup': build_lookup_map(mapping_sheets['二级商户号映射表-A01'], key_col_idx=0, value_col_idx=1),
         'a07_lookup': build_lookup_map(mapping_sheets['二级商户号映射表-A07'], key_col_idx=0, value_col_idx=2),
+        'a07_lookup_ci': build_case_insensitive_lookup_map(mapping_sheets['二级商户号映射表-A07'], key_col_idx=0, value_col_idx=2),
         'pending_payout_keys': set(),
+        'pending_payout_keys_ci': set(),
         'pending_a07_keys': set(),
+        'pending_a07_keys_ci': set(),
         'payout_rows_added': [],
         'a07_rows_added': [],
+        'payout_rows_skipped_duplicates': [],
+        'a07_rows_skipped_duplicates': [],
         'special_rows_added': [],
         'required_fx_rate_pairs': [],
         'required_fx_rate_keys_seen': set(),
@@ -649,20 +708,36 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
         if (
             ap_val == "A07"
             and ah_value
-            and ah_value not in mapping_context['a07_lookup']
-            and ah_value not in mapping_context['pending_a07_keys']
         ):
-            insert_row = append_a07_mapping_row(ws_a07, ah_value)
-            mapping_context['a07_lookup'][ah_value] = ""
-            mapping_context['pending_a07_keys'].add(ah_value)
-            mapping_context['a07_rows_added'].append([insert_row, ah_value])
+            ah_value_ci = normalize_case_insensitive_key(ah_value)
+            existing_a07_entry = mapping_context['a07_lookup_ci'].get(ah_value_ci)
+            if existing_a07_entry is not None:
+                mapping_context['a07_rows_skipped_duplicates'].append([
+                    ah_value,
+                    existing_a07_entry['key'],
+                    "case-insensitive duplicate",
+                ])
+            elif ah_value_ci in mapping_context['pending_a07_keys_ci']:
+                mapping_context['a07_rows_skipped_duplicates'].append([
+                    ah_value,
+                    ah_value,
+                    "case-insensitive duplicate (pending insert)",
+                ])
+            else:
+                insert_row = append_a07_mapping_row(ws_a07, ah_value)
+                mapping_context['a07_lookup'][ah_value] = ""
+                update_case_insensitive_lookup(mapping_context['a07_lookup_ci'], ah_value, "")
+                mapping_context['pending_a07_keys'].add(ah_value)
+                mapping_context['pending_a07_keys_ci'].add(ah_value_ci)
+                mapping_context['a07_rows_added'].append([insert_row, ah_value])
 
-        aq_value = resolve_aq_value(
+        aq_value = resolve_aq_value_with_case_insensitive_a07(
             ap_val,
             ah_value,
             ab_value,
             mapping_context['a01_lookup'],
             mapping_context['a07_lookup'],
+            mapping_context['a07_lookup_ci'],
         )
         ar_value = f"{ap_val}{aq_value}{aj_value}"
 
@@ -670,15 +745,40 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
             ap_val
             and aq_value
             and aj_value
-            and ar_value not in mapping_context['payout_lookup']
-            and ar_value not in mapping_context['pending_payout_keys']
         ):
-            insert_row = append_payout_currency_row(ws_payout, ap_val, ah_value, aj_value)
-            mapping_context['payout_lookup'][ar_value] = ""
-            mapping_context['pending_payout_keys'].add(ar_value)
-            mapping_context['payout_rows_added'].append([insert_row, ap_val, ah_value, aj_value, ar_value])
+            ar_value_ci = normalize_case_insensitive_key(ar_value)
+            existing_payout_entry = mapping_context['payout_lookup_ci'].get(ar_value_ci)
+            if existing_payout_entry is not None:
+                mapping_context['payout_rows_skipped_duplicates'].append([
+                    ap_val,
+                    ah_value,
+                    aj_value,
+                    ar_value,
+                    existing_payout_entry['key'],
+                    "case-insensitive duplicate",
+                ])
+            elif ar_value_ci in mapping_context['pending_payout_keys_ci']:
+                mapping_context['payout_rows_skipped_duplicates'].append([
+                    ap_val,
+                    ah_value,
+                    aj_value,
+                    ar_value,
+                    ar_value,
+                    "case-insensitive duplicate (pending insert)",
+                ])
+            else:
+                insert_row = append_payout_currency_row(ws_payout, ap_val, ah_value, aj_value)
+                mapping_context['payout_lookup'][ar_value] = ""
+                update_case_insensitive_lookup(mapping_context['payout_lookup_ci'], ar_value, "")
+                mapping_context['pending_payout_keys'].add(ar_value)
+                mapping_context['pending_payout_keys_ci'].add(ar_value_ci)
+                mapping_context['payout_rows_added'].append([insert_row, ap_val, ah_value, aj_value, ar_value])
 
-        al_value = str(mapping_context['payout_lookup'].get(ar_value, "")).strip()
+        al_value = get_lookup_value(
+            mapping_context['payout_lookup'],
+            mapping_context['payout_lookup_ci'],
+            ar_value,
+        )
         am_value = account_statement_currency_lookup.get(ai_key, "")
         if aj_value and al_value and am_value and al_value != am_value and aj_value != al_value:
             track_required_fx_rate_pair(mapping_context, aj_value, al_value)
@@ -692,6 +792,8 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
         'dropped_special_rows_count': dropped_special_rows_count,
         'payout_rows_added': mapping_context['payout_rows_added'],
         'a07_rows_added': mapping_context['a07_rows_added'],
+        'payout_rows_skipped_duplicates': mapping_context['payout_rows_skipped_duplicates'],
+        'a07_rows_skipped_duplicates': mapping_context['a07_rows_skipped_duplicates'],
         'special_rows_added': mapping_context['special_rows_added'],
         'required_fx_rate_pairs': mapping_context['required_fx_rate_pairs'],
     }
@@ -1026,6 +1128,8 @@ def run_fx_reconciliation(root, log_path=None):
         'revalidated_special_rows': revalidated_special_rows,
         'a07_rows_added': processing_results['a07_rows_added'],
         'payout_rows_added': processing_results['payout_rows_added'],
+        'a07_rows_skipped_duplicates': processing_results['a07_rows_skipped_duplicates'],
+        'payout_rows_skipped_duplicates': processing_results['payout_rows_skipped_duplicates'],
         'fx_rate_rows_added': fx_rate_rows_added,
         'special_rows_added': processing_results['special_rows_added'],
     }
