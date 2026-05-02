@@ -447,3 +447,93 @@ Set column widths as follows:
 
 ### 4. Set Default Active Sheet
 - Set **`预估换汇汇总`** as the active sheet at the end
+
+
+
+fx_reconciliation_core.py is responsible for preparing for the data by importing them from other files, 
+and then human needs to be involved to fill some missing data by looking into the production system. 
+fx_consolidation_postprocess.py is responsible for processing these to generate/update multiple sheets with summarized data. 
+
+fx_consolidation_postprocess.py might fail because the top table in 预估换汇汇总 needs to use B&D to lookup the column H from 每日汇率(oc系统中获取）.
+Here is the data flow 渠道订单 => 数据透视表 => 1数透结果 => 预估换汇汇总. In order to avoid the lookup failure, we need to check if there's missing record in 每日汇率(oc系统中获取）.
+Here is the requirement to add logic in fx_reconciliation_core.py:
+- Find all the unique combination of AJ and AL in 渠道订单, and then find the record in 每日汇率(oc系统中获取）by its column I (its formula is D&E). 
+  If no record can be found, append a row at the end of 每日汇率(oc系统中获取）, filling D = AJ, E = AL, I = D&E
+- Include the information in the log summary and 处理摘要
+
+## FX Reconciliation & Post-Processing Enhancement
+
+### Context
+
+- `fx_reconciliation_core.py`
+  - Responsible for importing and preparing raw data from multiple sources
+  - Requires **manual intervention** to fill in missing data based on the production system
+
+- `fx_consolidation_postprocess.py`
+  - Responsible for processing prepared data
+  - Generates and updates multiple sheets with summarized results
+
+---
+
+### Problem
+
+`fx_consolidation_postprocess.py` may fail due to missing lookup data.
+
+- In sheet **`预估换汇汇总`**, the top table uses:
+  - Columns **B & D** → to lookup column **H**
+  - Lookup source: **`每日汇率(oc系统中获取）`**
+
+- Data flow:
+  `渠道订单 → 数据透视表 → 1数透结果 → 预估换汇汇总`
+
+
+- Root cause:
+  - Missing records in **`每日汇率(oc系统中获取）`** lead to lookup failures
+
+---
+
+### Solution Requirement
+
+Add validation and auto-repair logic in `fx_reconciliation_core.py` to ensure all required lookup records exist.
+
+---
+
+### Implementation Logic
+
+1. **Extract Required Keys**
+ - From sheet **`渠道订单`**
+ - Collect all **unique combinations of (AJ, AL)**
+
+2. **Validate Against Exchange Rate Table**
+ - Target sheet: **`每日汇率(oc系统中获取）`**
+ - Lookup column: **Column I**
+   - (Column I is derived from `D & E`)
+
+3. **Handle Missing Records**
+ - For each `(AJ, AL)` combination:
+   - If no matching record exists in Column I:
+     - Append a new row at the end of the sheet
+     - Populate:
+       - Column D = AJ
+       - Column E = AL
+       - Column I = D & E (same formula/logic)
+ - Human will fill the data you appended later.
+---
+
+### Logging & Reporting
+
+- Include all auto-added records in:
+- **Log summary**
+- **处理摘要**
+
+- Each log entry should include:
+  - Missing key (AJ, AL)
+  - Whether a new row was inserted
+
+---
+
+### Expected Outcome
+
+- Ensure all required lookup keys exist before post-processing
+  - Prevent failures in `fx_consolidation_postprocess.py`
+  - Improve data completeness and pipeline robustness

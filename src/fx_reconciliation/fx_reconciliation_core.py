@@ -471,6 +471,8 @@ def load_mapping_context(wip_path):
         'payout_rows_added': [],
         'a07_rows_added': [],
         'special_rows_added': [],
+        'required_fx_rate_pairs': [],
+        'required_fx_rate_keys_seen': set(),
     }
 
 
@@ -494,12 +496,78 @@ def append_a07_mapping_row(ws_a07, ah_value):
     return insert_row
 
 
+def append_fx_rate_row(ws_fx_rate, aj_value, al_value):
+    insert_row = find_last_non_empty_row(ws_fx_rate, 4) + 1
+    ws_fx_rate.cell(row=insert_row, column=4).value = aj_value
+    ws_fx_rate.cell(row=insert_row, column=5).value = al_value
+    ws_fx_rate.cell(row=insert_row, column=9).value = f"=D{insert_row}&E{insert_row}"
+    return insert_row
+
+
 def append_special_order_row(ws_spec, data_row, next_spec):
     for c_idx, val in enumerate(data_row, start=1):
         ws_spec.cell(row=next_spec, column=c_idx).value = to_excel_cell_value(val)
     ws_spec.cell(row=next_spec, column=35).value = f"=D{next_spec}&E{next_spec}"
     ws_spec.cell(row=next_spec, column=36).value = f"=XLOOKUP(A{next_spec},账户流水!$R:$R,账户流水!$R:$R)"
     ws_spec.cell(row=next_spec, column=37).value = f"=LEFTB(Y{next_spec},10)"
+
+
+#######################################################
+#  每日汇率(oc系统中获取） Validation and Auto-Append
+#######################################################
+def track_required_fx_rate_pair(mapping_context, aj_value, al_value):
+    aj_text = str(aj_value).strip() if aj_value is not None else ""
+    al_text = str(al_value).strip() if al_value is not None else ""
+    if not aj_text or not al_text:
+        return
+
+    pair_key = f"{aj_text}{al_text}"
+    if pair_key in mapping_context['required_fx_rate_keys_seen']:
+        return
+
+    mapping_context['required_fx_rate_keys_seen'].add(pair_key)
+    mapping_context['required_fx_rate_pairs'].append([aj_text, al_text, pair_key])
+
+
+def build_account_statement_currency_lookup(account_statement_df):
+    lookup = {}
+    if account_statement_df.empty:
+        return lookup
+
+    for _, row in account_statement_df.iterrows():
+        ai_key = str(row['Internal_Key_R']).strip()
+        if not ai_key or ai_key in lookup:
+            continue
+        am_value = str(row.iloc[6]).strip() if pd.notna(row.iloc[6]) else ""
+        lookup[ai_key] = am_value
+
+    return lookup
+
+
+def build_fx_rate_key_set(ws_fx_rate):
+    existing_keys = set()
+    for row_number in range(2, ws_fx_rate.max_row + 1):
+        col_d = str(ws_fx_rate.cell(row=row_number, column=4).value or "").strip()
+        col_e = str(ws_fx_rate.cell(row=row_number, column=5).value or "").strip()
+        if col_d and col_e:
+            key = f"{col_d}{col_e}"
+            existing_keys.add(key)
+    return existing_keys
+
+
+def ensure_daily_fx_rate_keys(ws_fx_rate, required_fx_rate_pairs):
+    existing_keys = build_fx_rate_key_set(ws_fx_rate)
+    fx_rate_rows_added = []
+
+    for aj_value, al_value, pair_key in required_fx_rate_pairs:
+        if pair_key in existing_keys:
+            continue
+
+        insert_row = append_fx_rate_row(ws_fx_rate, aj_value, al_value)
+        existing_keys.add(pair_key)
+        fx_rate_rows_added.append([insert_row, aj_value, al_value, pair_key, "Yes"])
+
+    return fx_rate_rows_added
 
 
 #######################################################
@@ -532,6 +600,7 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
     dropped_special_rows_count = 0
     loop_start = time.perf_counter()
     account_statement_keys = set(account_statement_df['Internal_Key_R'])
+    account_statement_currency_lookup = build_account_statement_currency_lookup(account_statement_df)
 
     ws_chan = worksheet_handles['ws_chan']
     ws_spec = worksheet_handles['ws_spec']
@@ -609,6 +678,11 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
             mapping_context['pending_payout_keys'].add(ar_value)
             mapping_context['payout_rows_added'].append([insert_row, ap_val, ah_value, aj_value, ar_value])
 
+        al_value = str(mapping_context['payout_lookup'].get(ar_value, "")).strip()
+        am_value = account_statement_currency_lookup.get(ai_key, "")
+        if aj_value and al_value and am_value and al_value != am_value and aj_value != al_value:
+            track_required_fx_rate_pair(mapping_context, aj_value, al_value)
+
         write_channel_order_row(ws_chan, curr_row, data_row)
         curr_row += 1
 
@@ -619,6 +693,7 @@ def process_target_channel_data(target_data, account_statement_df, worksheet_han
         'payout_rows_added': mapping_context['payout_rows_added'],
         'a07_rows_added': mapping_context['a07_rows_added'],
         'special_rows_added': mapping_context['special_rows_added'],
+        'required_fx_rate_pairs': mapping_context['required_fx_rate_pairs'],
     }
 
 
@@ -650,7 +725,7 @@ def write_account_statement_sheet(ws_acc, account_statement_df):
 #######################################################
 #  处理摘要 Logging and Sheet Output
 #######################################################
-def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, special_rows_added, ws_a07, ws_payout):
+def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, fx_rate_rows_added, special_rows_added, ws_a07, ws_payout, ws_fx_rate):
     logging.info("Dropped rows while moving to 特殊的渠道订单 (AH starts with Delligent DE): %s", dropped_special_rows_count)
     logging.info(
         "\n%s",
@@ -688,6 +763,20 @@ def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07
     logging.info(
         "\n%s",
         format_summary_table(
+            "Added rows in 每日汇率(oc系统中获取）",
+            [
+                "Row",
+                f"D-{get_sheet_header(ws_fx_rate, 4)}",
+                f"E-{get_sheet_header(ws_fx_rate, 5)}",
+                f"I-{get_sheet_header(ws_fx_rate, 9)}",
+                "Inserted",
+            ],
+            fx_rate_rows_added,
+        ),
+    )
+    logging.info(
+        "\n%s",
+        format_summary_table(
             "Added rows in 特殊的渠道订单",
             ["Row", "C-交易流水号", "A-渠道订单号", "AP-通道名称", "AI-Key"],
             special_rows_added,
@@ -695,7 +784,7 @@ def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07
     )
 
 
-def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, special_rows_added):
+def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, fx_rate_rows_added, special_rows_added):
     if SUMMARY_SHEET_NAME in wb.sheetnames:
         ws_summary = wb[SUMMARY_SHEET_NAME]
         ws_summary.delete_rows(1, ws_summary.max_row)
@@ -720,6 +809,11 @@ def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_speci
             payout_rows_added,
         ),
         (
+            "Added rows in 每日汇率(oc系统中获取）",
+            ["Row", "D-原币种", "E-目标币种", "I-货币对", "Inserted"],
+            fx_rate_rows_added,
+        ),
+        (
             "Added rows in 特殊的渠道订单",
             ["Row", "C-交易流水号", "A-渠道订单号", "AP-通道名称", "AI-Key"],
             special_rows_added,
@@ -739,6 +833,7 @@ def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_speci
         ("丢弃的 Delligent DE 特殊订单", dropped_special_rows_count),
         ("新增二级商户号映射表-A07", len(a07_rows_added)),
         ("新增打款币种", len(payout_rows_added)),
+        ("新增每日汇率(oc系统中获取）", len(fx_rate_rows_added)),
         ("新增特殊的渠道订单", len(special_rows_added)),
     ]
 
@@ -867,6 +962,14 @@ def run_fx_reconciliation(root, log_path=None):
     )
     logging.info("Phase complete: process_target_channel_data elapsed=%.1fs", time.perf_counter() - phase_start)
 
+    # Ensure every required 渠道订单 (AJ, AL) lookup key exists in 每日汇率(oc系统中获取）.
+    phase_start = time.perf_counter()
+    fx_rate_rows_added = ensure_daily_fx_rate_keys(
+        wb[FX_RATE_TARGET_SHEET_NAME],
+        processing_results['required_fx_rate_pairs'],
+    )
+    logging.info("Phase complete: ensure_daily_fx_rate_keys elapsed=%.1fs", time.perf_counter() - phase_start)
+
     # Remove dropped or reclassified statement rows from the 账户流水 dataset.
     if processing_results['keys_to_remove_from_statement']:
         account_statement_df = account_statement_df[
@@ -887,9 +990,11 @@ def run_fx_reconciliation(root, log_path=None):
         processing_results['dropped_special_rows_count'],
         processing_results['a07_rows_added'],
         processing_results['payout_rows_added'],
+        fx_rate_rows_added,
         processing_results['special_rows_added'],
         workbook_state['ws_a07'],
         workbook_state['ws_payout'],
+        wb[FX_RATE_TARGET_SHEET_NAME],
     )
     logging.info("Phase complete: log_summary_tables elapsed=%.1fs", time.perf_counter() - phase_start)
 
@@ -904,6 +1009,7 @@ def run_fx_reconciliation(root, log_path=None):
         processing_results['dropped_special_rows_count'],
         processing_results['a07_rows_added'],
         processing_results['payout_rows_added'],
+        fx_rate_rows_added,
         processing_results['special_rows_added'],
     )
     logging.info("Phase complete: write_summary_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
@@ -920,6 +1026,7 @@ def run_fx_reconciliation(root, log_path=None):
         'revalidated_special_rows': revalidated_special_rows,
         'a07_rows_added': processing_results['a07_rows_added'],
         'payout_rows_added': processing_results['payout_rows_added'],
+        'fx_rate_rows_added': fx_rate_rows_added,
         'special_rows_added': processing_results['special_rows_added'],
     }
 
