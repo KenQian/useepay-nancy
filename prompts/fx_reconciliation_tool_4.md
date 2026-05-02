@@ -4,7 +4,7 @@ Now we've implemented fx_reconciliation_core.py and fx_consolidation_postprocess
 - execute fx_consolidation_postprocess to generate the final report. 
 
 Context
-- fx_summary_workflow_app.py and run_fx_summary_workflow_windows.cmd were created initially before finalize_fx_summary_report.py for non-tech people to use the tool from Windows.
+- fx_summary_workflow_app.py and 各通道需换汇情况汇总.cmd were created initially before finalize_fx_summary_report.py for non-tech people to use the tool from Windows.
 
 New Requirement
 - I need better file names to replace fx_reconciliation_core.py and fx_consolidation_postprocess.py. Please give me options for me to choose.
@@ -45,7 +45,7 @@ The system currently consists of two main scripts:
 
 ### Context
 
-- `fx_summary_workflow_app.py` and `run_fx_summary_workflow_windows.cmd` were created earlier
+- `fx_summary_workflow_app.py` and `各通道需换汇情况汇总.cmd` were created earlier
 - Purpose: enable **non-technical users** to run the workflow on Windows
 
 ---

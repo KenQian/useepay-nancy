@@ -12,7 +12,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-%PYTHON_CMD% "%SCRIPT_DIR%merchant_analyzer\merchant_analyzer_windows.py"
+%PYTHON_CMD% "%SCRIPT_DIR%merchant_analyzer\merchant_anomaly_detector_windows.py"
 if errorlevel 1 (
   echo.
   echo 程序未成功完成，请查看弹窗提示或 result 文件夹中的日志。

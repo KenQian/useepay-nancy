@@ -8,9 +8,8 @@ DIST_DIR = REPO_ROOT / "dist"
 PACKAGE_NAME = "useepay_toolkit"
 
 INCLUDE_PATHS = [
-    REPO_ROOT / "src" / "run_fx_summary_workflow_windows.cmd",
-    REPO_ROOT / "src" / "run_fx_summary_workflow_mac.command",
-    REPO_ROOT / "src" / "run_merchant_analyzer_windows.cmd",
+    REPO_ROOT / "src" / "各通道需换汇情况汇总.cmd",
+    REPO_ROOT / "src" / "商户交易异常检测.cmd",
     REPO_ROOT / "src" / "fx_summary_workflow",
     REPO_ROOT / "src" / "merchant_analyzer",
     REPO_ROOT / "src" / "tools" / "compare_csv_files.py",
