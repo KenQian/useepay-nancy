@@ -2,8 +2,8 @@
 FX Consolidation Post-Processing Tool
 -------------------------------------
 Purpose:
-    Rebuilds 数据透视表 and 1数透结果 from a completed FX workbook after
-    the user has finished manual lookup inputs and saved the file.
+    Rebuilds 数据透视表 and 1数透结果 from the prepared FX workbook after
+    the user has finished manual lookup inputs, then publishes the final report.
 """
 
 import argparse
@@ -17,12 +17,14 @@ from openpyxl.styles import Alignment, PatternFill
 
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 DATE_FORMAT = '%H:%M:%S'
+IN_PROGRESS_SUFFIX = '-处理中.xlsx'
 SETTLEMENT_FLOW_INPUT_SHEET_NAME = '数据透视表'
 SETTLEMENT_FLOW_OUTPUT_SHEET_NAME = '1数透结果'
 CHANNEL_ORDER_SHEET_NAME = '渠道订单'
 ACCOUNT_STATEMENT_SHEET_NAME = '账户流水'
 DAILY_EXCHANGE_RATE_SHEET_NAME = '每日汇率(oc系统中获取）'
 ESTIMATED_FX_SUMMARY_SHEET_NAME = '预估换汇汇总'
+SUMMARY_SHEET_NAME = '处理摘要'
 PIVOT_TOTAL_FILL = PatternFill(fill_type='solid', fgColor='FFF2F1F7')
 PIVOT_HIGHLIGHT_FILL = PatternFill(fill_type='solid', fgColor='FFFFFF00')
 RESULT_HEADER_FILL = PatternFill(fill_type='solid', fgColor='FF00B050')
@@ -76,6 +78,22 @@ def configure_run_logging(log_path):
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
     file_handler._fx_consolidation_postprocess_file_handler = True
     logger.addHandler(file_handler)
+
+
+def build_final_report_path(workbook_path):
+    if workbook_path.endswith(IN_PROGRESS_SUFFIX):
+        return workbook_path[:-len(IN_PROGRESS_SUFFIX)] + '.xlsx'
+    return workbook_path
+
+
+def publish_final_report(workbook_path):
+    final_path = build_final_report_path(workbook_path)
+    if final_path == workbook_path:
+        return final_path
+    if os.path.exists(final_path):
+        os.remove(final_path)
+    os.rename(workbook_path, final_path)
+    return final_path
 
 
 def normalize_cell_text(value):
@@ -502,6 +520,7 @@ def validate_settlement_flow_input_sheet(ws_pivot, expected_rows):
 
 
 def rebuild_settlement_flow_input_sheet(write_wb, read_wb=None):
+    logging.info("Rebuilding 数据透视表 input area A:G from 渠道订单 and 账户流水...")
     ws_pivot = recreate_pivot_source_sheet(write_wb)
     ws_channel_order_values = None
     if read_wb is not None and CHANNEL_ORDER_SHEET_NAME in read_wb.sheetnames:
@@ -578,6 +597,7 @@ def validate_settlement_flow_summary(ws_pivot, grouped_rows, grand_total_row):
 
 
 def build_settlement_flow_summary(ws_pivot, source_rows):
+    logging.info("Building 数据透视表 summary table in K:O from %s source rows...", len(source_rows))
     grouped_rows, grand_total_row = build_grouped_pivot_rows(source_rows)
 
     for row_number in range(2, ws_pivot.max_row + 1):
@@ -628,6 +648,7 @@ def publish_settlement_flow_results(write_wb, ws_pivot):
         raise KeyError(f"Target sheet not found in workbook: {SETTLEMENT_FLOW_OUTPUT_SHEET_NAME}")
 
     ws_result = write_wb[SETTLEMENT_FLOW_OUTPUT_SHEET_NAME]
+    logging.info("Publishing 1数透结果 tables from 数据透视表: A:E primary copy and H:L remapped copy...")
     source_last_row = get_last_data_row(ws_pivot, 11, 15, min_row=1)
     source_rows = get_range_values(ws_pivot, 1, source_last_row, 11, 15) if source_last_row >= 1 else []
 
@@ -678,6 +699,7 @@ def publish_settlement_flow_results(write_wb, ws_pivot):
 #  账户流水 / 预估换汇汇总 Transaction Date Derivation
 #######################################################
 def build_transaction_dates(ws_account_statement):
+    logging.info("Deriving transaction date label from 账户流水 column A...")
     unique_dates = set()
 
     for row_number in range(2, ws_account_statement.max_row + 1):
@@ -691,15 +713,19 @@ def build_transaction_dates(ws_account_statement):
     sorted_dates = sorted(unique_dates)
     formatted_dates = [date_value.strftime('%Y-%m-%d') for date_value in sorted_dates]
     if len(formatted_dates) == 1:
-        return formatted_dates[0]
+        transaction_dates = formatted_dates[0]
+    else:
+        transaction_dates = formatted_dates[0] + ''.join(f"&{date_value[-2:]}" for date_value in formatted_dates[1:])
 
-    return formatted_dates[0] + ''.join(f"&{date_value[-2:]}" for date_value in formatted_dates[1:])
+    logging.info("Derived transaction date label: %s (%s unique dates)", transaction_dates, len(formatted_dates))
+    return transaction_dates
 
 
 #######################################################
 #  每日汇率(oc系统中获取） Lookup Preparation
 #######################################################
 def build_daily_exchange_rate_lookup(ws_daily_exchange_rate):
+    logging.info("Building 每日汇率(oc系统中获取） lookup from column I/H with D/E fallback keys...")
     exchange_rate_lookup = {}
 
     for row_number in range(2, ws_daily_exchange_rate.max_row + 1):
@@ -716,6 +742,7 @@ def build_daily_exchange_rate_lookup(ws_daily_exchange_rate):
             numeric_cell_value(ws_daily_exchange_rate.cell(row=row_number, column=8).value),
         )
 
+    logging.info("Built 每日汇率 lookup with %s keys", len(exchange_rate_lookup))
     return exchange_rate_lookup
 
 
@@ -723,6 +750,11 @@ def build_daily_exchange_rate_lookup(ws_daily_exchange_rate):
 #  1数透结果 / 预估换汇汇总 Row Calculation
 #######################################################
 def build_estimated_fx_summary_rows(ws_settlement_flow_output, transaction_dates, exchange_rate_lookup):
+    logging.info(
+        "Calculating 预估换汇汇总 top table rows from 1数透结果!H:L using transaction label %s and %s exchange-rate keys...",
+        transaction_dates,
+        len(exchange_rate_lookup),
+    )
     source_last_row = get_last_data_row(ws_settlement_flow_output, 8, 12, min_row=2)
     source_rows = get_range_values(ws_settlement_flow_output, 2, source_last_row, 8, 12) if source_last_row >= 2 else []
     estimated_rows = []
@@ -779,6 +811,7 @@ def build_estimated_fx_summary_rows(ws_settlement_flow_output, transaction_dates
             'j_formula': build_excel_formula(f"D{row_offset}&G{row_offset}"),
         })
 
+    logging.info("Calculated %s rows for 预估换汇汇总 top table", len(estimated_rows))
     return estimated_rows
 
 
@@ -850,6 +883,7 @@ def publish_estimated_fx_summary(write_wb, estimated_rows):
         raise KeyError(f"Target sheet not found in workbook: {ESTIMATED_FX_SUMMARY_SHEET_NAME}")
 
     ws_estimated_fx_summary = write_wb[ESTIMATED_FX_SUMMARY_SHEET_NAME]
+    logging.info("Publishing 预估换汇汇总 top table to A:J with %s detail rows plus Grand Total...", len(estimated_rows))
     if ws_estimated_fx_summary.max_row > 1:
         ws_estimated_fx_summary.delete_rows(2, ws_estimated_fx_summary.max_row - 1)
 
@@ -1032,6 +1066,13 @@ def publish_fx_transaction_table_a(ws_fx_transaction, start_row, start_col, grou
         start_col + 3,
         FX_TRANSACTION_HEADER_FILL,
     )
+    logging.info(
+        "Published %s!表格A at A%s:D%s with %s grouped rows plus Grand Total",
+        ws_fx_transaction.title,
+        start_row,
+        start_row + 1 + len(data_rows),
+        len(grouped_rows),
+    )
     return {
         'start_row': start_row,
         'end_row': start_row + 1 + len(data_rows),
@@ -1055,6 +1096,13 @@ def publish_fx_transaction_table_b(ws_fx_transaction, start_row, start_col, non_
         start_col,
         [[row['payout_currency'], row['settlement_currency'], row['sum_payout_amount'], row['sum_settlement_amount']] for row in non_netting_rows],
     )
+    logging.info(
+        "Published %s!表格B at A%s:D%s with %s non-netting rows",
+        ws_fx_transaction.title,
+        start_row,
+        start_row + 1 + max(len(non_netting_rows), 1),
+        len(non_netting_rows),
+    )
     return {
         'start_row': start_row,
         'end_row': start_row + 1 + max(len(non_netting_rows), 1),
@@ -1064,6 +1112,12 @@ def publish_fx_transaction_table_b(ws_fx_transaction, start_row, start_col, non_
 
 def publish_fx_transaction_table_c(ws_fx_transaction, start_row, start_col, netting_groups):
     write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格C(轧差)')
+    logging.info(
+        "Publishing %s!表格C at H%s:K... for %s netting groups",
+        ws_fx_transaction.title,
+        start_row,
+        len(netting_groups),
+    )
     current_row = start_row + 1
     net_rows = []
 
@@ -1131,9 +1185,17 @@ def publish_fx_transaction_table_c(ws_fx_transaction, start_row, start_col, nett
         if index != len(netting_groups) - 1:
             current_row += 1
 
+    end_row = max(start_row + 1, current_row - 1)
+    logging.info(
+        "Published %s!表格C at H%s:K%s with %s net-result rows",
+        ws_fx_transaction.title,
+        start_row,
+        end_row,
+        len(net_rows),
+    )
     return {
         'start_row': start_row,
-        'end_row': max(start_row + 1, current_row - 1),
+        'end_row': end_row,
         'rows': net_rows,
     }
 
@@ -1170,6 +1232,15 @@ def publish_fx_transaction_table_d(ws_fx_transaction, start_row, start_col, non_
             fill_fx_transaction_row(ws_fx_transaction, current_row, start_col, start_col + 3, FX_TRANSACTION_NET_RESULT_FILL)
         current_row += 1
 
+    logging.info(
+        "Published %s!表格D at A%s:D%s with %s combined rows (%s non-netting + %s net-result)",
+        ws_fx_transaction.title,
+        start_row,
+        start_row + 1 + max(len(combined_rows), 1),
+        len(combined_rows),
+        len(non_netting_rows),
+        len(net_rows),
+    )
     return {
         'start_row': start_row,
         'end_row': start_row + 1 + max(len(combined_rows), 1),
@@ -1198,6 +1269,13 @@ def publish_fx_transaction_table_e(ws_fx_transaction, start_row, start_col, tabl
         start_col,
         [[row['sell_currency'], row['sell_amount'], row['buy_currency'], row['buy_amount']] for row in table_e_rows],
     )
+    logging.info(
+        "Published %s!表格E at A%s:D%s with %s rows for trading input",
+        ws_fx_transaction.title,
+        start_row,
+        start_row + 1 + max(len(table_e_rows), 1),
+        len(table_e_rows),
+    )
     return {
         'start_row': start_row,
         'end_row': start_row + 1 + max(len(table_e_rows), 1),
@@ -1209,6 +1287,12 @@ def publish_fx_transaction_table_f(ws_fx_transaction, start_row, start_col, tabl
     headers = ['卖出币种', '卖出金额', '买入币种']
     write_fx_transaction_title_cell(ws_fx_transaction, start_row, start_col, '表格F(最终数据)')
     write_fx_transaction_header(ws_fx_transaction, start_row + 1, start_col, headers)
+    logging.info(
+        "Publishing %s!表格F at H%s:J... from %s 表格E rows with rounded amounts",
+        ws_fx_transaction.title,
+        start_row,
+        len(table_e_rows),
+    )
     table_f_rows = []
     for row_offset, row in enumerate(table_e_rows):
         table_e_row_number = start_row + 2 + row_offset
@@ -1226,6 +1310,13 @@ def publish_fx_transaction_table_f(ws_fx_transaction, start_row, start_col, tabl
             start_col,
             [[row['sell_currency'], rounded_formula, row['buy_currency']]],
         )
+    logging.info(
+        "Published %s!表格F at H%s:J%s with %s final rows",
+        ws_fx_transaction.title,
+        start_row,
+        start_row + 1 + max(len(table_f_rows), 1),
+        len(table_f_rows),
+    )
     return {
         'start_row': start_row,
         'end_row': start_row + 1 + max(len(table_f_rows), 1),
@@ -1259,6 +1350,11 @@ def build_fx_transaction_summary_remarks(summary_rows):
 def append_fx_transaction_summary_table(write_wb, table_f_rows):
     ws_estimated_fx_summary = write_wb[ESTIMATED_FX_SUMMARY_SHEET_NAME]
     summary_header_row = get_last_data_row(ws_estimated_fx_summary, 1, 10, min_row=1) + 11
+    logging.info(
+        "Appending 预估换汇汇总 bottom summary table at A%s:E... based on %s 表格F rows",
+        summary_header_row,
+        len(table_f_rows),
+    )
     summary_rows = [
         {
             'sell_currency': row['sell_currency'],
@@ -1298,6 +1394,13 @@ def append_fx_transaction_summary_table(write_wb, table_f_rows):
         ws_estimated_fx_summary.cell(row=row_number, column=2).number_format = ESTIMATED_FX_SUMMARY_NUMBER_2_FORMAT
         ws_estimated_fx_summary.cell(row=row_number, column=3).alignment = Alignment(horizontal='center')
 
+    logging.info(
+        "Appended 预估换汇汇总 bottom summary table at A%s:E%s and merged remarks G%s:J%s",
+        summary_header_row,
+        summary_header_row + len(summary_rows),
+        summary_header_row,
+        summary_header_row,
+    )
     return {
         'summary_header_row': summary_header_row,
         'summary_rows': summary_rows,
@@ -1306,6 +1409,11 @@ def append_fx_transaction_summary_table(write_wb, table_f_rows):
 
 def publish_fx_transaction_analysis(write_wb, transaction_dates, estimated_rows):
     ws_fx_transaction = recreate_fx_transaction_sheet(write_wb, transaction_dates)
+    logging.info(
+        "Publishing FX transaction analysis sheet %s from %s estimated FX rows...",
+        ws_fx_transaction.title,
+        len(estimated_rows),
+    )
     apply_fx_transaction_sheet_column_widths(ws_fx_transaction)
     table_a_rows, table_a_grand_total = build_fx_transaction_table_a(estimated_rows)
     non_netting_rows, netting_groups = partition_fx_transaction_netting_rows(table_a_rows)
@@ -1358,7 +1466,7 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
     if log_path is None:
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         workbook_dir = os.path.dirname(workbook_path)
-        log_path = os.path.join(workbook_dir, f'fx_consolidation_postprocess_{timestamp}.log')
+        log_path = os.path.join(workbook_dir, f'finalize_fx_summary_report_{timestamp}.log')
 
     configure_run_logging(log_path)
     logging.info("Starting FX consolidation post-processing...")
@@ -1382,6 +1490,11 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
 
         ws_account_statement = read_wb[ACCOUNT_STATEMENT_SHEET_NAME]
         ws_daily_exchange_rate = read_wb[DAILY_EXCHANGE_RATE_SHEET_NAME]
+        logging.info(
+            "Loaded workbook sheets for finalization: %s rows in 账户流水, %s rows in 每日汇率(oc系统中获取）",
+            max(ws_account_statement.max_row - 1, 0),
+            max(ws_daily_exchange_rate.max_row - 1, 0),
+        )
 
         # Rebuild 数据透视表 input rows from 渠道订单.
         ws_pivot, source_rows = rebuild_settlement_flow_input_sheet(write_wb, read_wb)
@@ -1415,8 +1528,19 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
                 transaction_dates,
                 estimated_fx_summary_results['estimated_fx_summary_rows'],
             )
+        else:
+            logging.info(
+                "Skipping FX transaction analysis because transaction_dates=%s and estimated row count=%s",
+                transaction_dates,
+                len(estimated_fx_summary_results['estimated_fx_summary_rows']),
+            )
+
+        if SUMMARY_SHEET_NAME in write_wb.sheetnames:
+            logging.info("Removing intermediate sheet before final save: %s", SUMMARY_SHEET_NAME)
+            del write_wb[SUMMARY_SHEET_NAME]
 
         # Save the updated workbook.
+        logging.info("Saving finalized workbook updates back to: %s", workbook_path)
         write_wb.active = write_wb.sheetnames.index(ESTIMATED_FX_SUMMARY_SHEET_NAME)
         write_wb.save(workbook_path)
         logging.info("Completed FX consolidation post-processing: %s", workbook_path)
@@ -1434,15 +1558,24 @@ def run_fx_consolidation_postprocess(workbook_path, log_path=None):
     }
 
 
+def finalize_fx_summary_report(workbook_path, log_path=None):
+    result = run_fx_consolidation_postprocess(workbook_path, log_path=log_path)
+    final_path = publish_final_report(result['workbook_path'])
+    logging.info("Completed final FX summary report: %s", final_path)
+    result['final_path'] = final_path
+    result['workbook_path'] = final_path
+    return result
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Rebuild 数据透视表 and 1数透结果 for a specified FX workbook.")
-    parser.add_argument("workbook", help="Path to the completed Excel workbook.")
+    parser = argparse.ArgumentParser(description="Generate the final FX summary report from an in-progress workbook.")
+    parser.add_argument("workbook", help="Path to the in-progress Excel workbook.")
     args = parser.parse_args()
 
     try:
-        run_fx_consolidation_postprocess(args.workbook)
+        finalize_fx_summary_report(args.workbook)
     except Exception as exc:
-        logging.error("FX consolidation post-processing failed: %s", exc)
+        logging.error("FX summary finalization failed: %s", exc)
         raise
 
 

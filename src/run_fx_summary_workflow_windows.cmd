@@ -12,10 +12,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
-%PYTHON_CMD% "%SCRIPT_DIR%fx_reconciliation\fx_reconciliation_windows.py"
+%PYTHON_CMD% "%SCRIPT_DIR%fx_summary_workflow\fx_summary_workflow_app.py"
 if errorlevel 1 (
   echo.
-  echo 程序未成功完成，请查看弹窗提示或 result 文件夹中的日志。
+  echo 程序未成功完成，请查看界面提示或 result 文件夹中的日志。
   pause
 )
 

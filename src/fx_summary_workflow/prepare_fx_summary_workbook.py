@@ -1,10 +1,10 @@
 """
-FX Settlement Automation Tool
------------------------------
+Prepare FX Summary Workbook
+---------------------------
 Purpose:
-    Automates the daily reconciliation of Foreign Exchange (FX) channel settlements.
-    Processes account statements, validates channel orders against historical
-    exceptions, and applies live Excel formulas for financial auditing.
+    Builds the intermediate workbook for 各通道需换汇情况汇总 by importing source
+    files, refreshing dependent sheets, and identifying manual-input work that
+    must be completed before the final report is generated.
 """
 
 import os
@@ -44,6 +44,9 @@ SPECIAL_ORDER_DROP_PREFIXES = [
 FX_RATE_SOURCE_FILENAME = '基本汇率.xlsx'
 FX_RATE_TARGET_SHEET_NAME = '每日汇率(oc系统中获取）'
 FX_RATE_SOURCE_SHEET_NAME = '基本汇率'
+REPORT_FILENAME_PREFIX = '各通道需换汇情况汇总-'
+IN_PROGRESS_SUFFIX = '-处理中'
+IN_PROGRESS_FILENAME_SUFFIX = f'{IN_PROGRESS_SUFFIX}.xlsx'
 FX_RATE_HEADER_NAMES = {
     '汇率来源',
     '原币种',
@@ -273,8 +276,13 @@ def get_sheet_header(ws, column_index):
 
 
 def get_latest_baseline(root_dir):
-    """Finds the most recent non-WIP baseline file in the directory."""
-    files = [f for f in os.listdir(root_dir) if f.startswith('各通道需换汇情况汇总-') and f.endswith('.xlsx') and '-wip' not in f]
+    """Finds the most recent completed baseline file in the directory."""
+    files = [
+        f for f in os.listdir(root_dir)
+        if f.startswith(REPORT_FILENAME_PREFIX)
+        and f.endswith('.xlsx')
+        and IN_PROGRESS_SUFFIX not in f
+    ]
     if not files:
         raise FileNotFoundError("Baseline file not found.")
     files.sort(reverse=True)
@@ -340,10 +348,74 @@ def discover_inputs(root):
 def create_wip_workbook(root, baseline_path):
     result_dir = ensure_result_dir(root)
     today_str = datetime.now().strftime('%Y%m%d')
-    wip_filename = f"各通道需换汇情况汇总-{today_str}-wip.xlsx"
+    wip_filename = f"{REPORT_FILENAME_PREFIX}{today_str}{IN_PROGRESS_FILENAME_SUFFIX}"
     wip_path = os.path.join(result_dir, wip_filename)
     shutil.copy2(baseline_path, wip_path)
     return wip_path
+
+
+def build_final_report_path(workbook_path):
+    if workbook_path.endswith(IN_PROGRESS_FILENAME_SUFFIX):
+        return workbook_path[:-len(IN_PROGRESS_FILENAME_SUFFIX)] + '.xlsx'
+    return workbook_path
+
+
+def create_manual_input_item(sheet_name, rows_added, display_label=None, detail_tokens=None, source_key=None):
+    detail_tokens = list(detail_tokens or [])
+    if not rows_added:
+        return None
+    return {
+        'sheet_name': sheet_name,
+        'display_label': display_label or sheet_name,
+        'detail_tokens': detail_tokens,
+        'row_count': len(rows_added),
+        'source_key': source_key or sheet_name,
+    }
+
+
+def build_manual_input_items(a07_rows_added, payout_rows_added, fx_rate_rows_added):
+    manual_input_items = []
+
+    a07_item = create_manual_input_item(
+        '二级商户号映射表-A07',
+        a07_rows_added,
+        source_key='a07_mapping',
+    )
+    if a07_item:
+        manual_input_items.append(a07_item)
+
+    payout_channels = []
+    payout_channels_seen = set()
+    for _, channel_name, *_ in payout_rows_added:
+        channel_text = str(channel_name).strip()
+        if not channel_text or channel_text in payout_channels_seen:
+            continue
+        payout_channels_seen.add(channel_text)
+        payout_channels.append(channel_text)
+
+    payout_label = '打款币种'
+    if payout_channels:
+        payout_label = f"打款币种({', '.join(payout_channels)})"
+
+    payout_item = create_manual_input_item(
+        '打款币种',
+        payout_rows_added,
+        display_label=payout_label,
+        detail_tokens=payout_channels,
+        source_key='payout_currency',
+    )
+    if payout_item:
+        manual_input_items.append(payout_item)
+
+    fx_rate_item = create_manual_input_item(
+        FX_RATE_TARGET_SHEET_NAME,
+        fx_rate_rows_added,
+        source_key='daily_exchange_rate',
+    )
+    if fx_rate_item:
+        manual_input_items.append(fx_rate_item)
+
+    return manual_input_items
 
 
 #######################################################
@@ -886,13 +958,19 @@ def log_summary_tables(revalidated_special_rows, dropped_special_rows_count, a07
     )
 
 
-def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, fx_rate_rows_added, special_rows_added):
+def write_summary_sheet(wb, source_root, workbook_path, log_path, revalidated_special_rows, dropped_special_rows_count, a07_rows_added, payout_rows_added, fx_rate_rows_added, special_rows_added):
     if SUMMARY_SHEET_NAME in wb.sheetnames:
         ws_summary = wb[SUMMARY_SHEET_NAME]
         ws_summary.delete_rows(1, ws_summary.max_row)
     else:
         channel_order_index = wb.sheetnames.index('渠道订单')
         ws_summary = wb.create_sheet(SUMMARY_SHEET_NAME, channel_order_index)
+
+    ws_summary.column_dimensions['A'].width = 36
+    ws_summary.column_dimensions['B'].width = 20
+    ws_summary.column_dimensions['C'].width = 36
+    ws_summary.column_dimensions['D'].width = 12
+    ws_summary.column_dimensions['E'].width = 45
 
     summary_tables = [
         (
@@ -929,7 +1007,7 @@ def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_speci
     metadata_rows = [
         ("运行时间", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
         ("源文件夹", source_root),
-        ("输出文件", final_path),
+        ("输出文件", workbook_path),
         ("日志文件", log_path),
         ("回补到渠道订单", len(revalidated_special_rows)),
         ("丢弃的 Delligent DE 特殊订单", dropped_special_rows_count),
@@ -967,27 +1045,21 @@ def write_summary_sheet(wb, source_root, final_path, log_path, revalidated_speci
 
 
 #######################################################
-#  Workbook Finalization
+#  Workbook Save
 #######################################################
-def finalize_workbook(wb, wip_path):
+def save_workbook(wb, workbook_path):
     save_start = time.perf_counter()
-    logging.info("Saving workbook to WIP path...")
-    final_path = wip_path.replace("-wip.xlsx", ".xlsx")
-    wb.save(wip_path)
+    logging.info("Saving workbook to in-progress path...")
+    wb.save(workbook_path)
     logging.info("Workbook save completed in %.1fs", time.perf_counter() - save_start)
-    rename_start = time.perf_counter()
-    if os.path.exists(final_path):
-        os.remove(final_path)
-    os.rename(wip_path, final_path)
-    logging.info("Workbook rename completed in %.1fs", time.perf_counter() - rename_start)
-    logging.info(f"COMPLETED. File: {final_path}")
-    return final_path
+    logging.info("Prepared workbook saved: %s", workbook_path)
+    return workbook_path
 
 
 #######################################################
 #  Main Orchestration
 #######################################################
-def run_fx_reconciliation(root, log_path=None):
+def prepare_fx_summary_workbook(root, log_path=None):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         raise FileNotFoundError(f"Source folder not found: {root}")
@@ -995,10 +1067,10 @@ def run_fx_reconciliation(root, log_path=None):
     result_dir = ensure_result_dir(root)
     if log_path is None:
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        log_path = os.path.join(result_dir, f'fx_reconciliation_{timestamp}.log')
+        log_path = os.path.join(result_dir, f'prepare_fx_summary_workbook_{timestamp}.log')
 
     configure_run_logging(log_path)
-    logging.info("Starting FX Settlement Automation...")
+    logging.info("Starting FX summary workbook preparation...")
     run_start = time.perf_counter()
 
     # Discover the latest baseline workbook and required source files.
@@ -1105,7 +1177,7 @@ def run_fx_reconciliation(root, log_path=None):
     write_summary_sheet(
         wb,
         root,
-        wip_path.replace("-wip.xlsx", ".xlsx"),
+        wip_path,
         log_path,
         revalidated_special_rows,
         processing_results['dropped_special_rows_count'],
@@ -1116,15 +1188,26 @@ def run_fx_reconciliation(root, log_path=None):
     )
     logging.info("Phase complete: write_summary_sheet elapsed=%.1fs", time.perf_counter() - phase_start)
 
-    # Save and finalize the workbook.
+    manual_input_items = build_manual_input_items(
+        processing_results['a07_rows_added'],
+        processing_results['payout_rows_added'],
+        fx_rate_rows_added,
+    )
+
+    if SUMMARY_SHEET_NAME in wb.sheetnames:
+        wb.active = wb.sheetnames.index(SUMMARY_SHEET_NAME)
+
+    # Save the in-progress workbook.
     phase_start = time.perf_counter()
-    final_path = finalize_workbook(wb, wip_path)
-    logging.info("Phase complete: finalize_workbook elapsed=%.1fs", time.perf_counter() - phase_start)
+    workbook_path = save_workbook(wb, wip_path)
+    logging.info("Phase complete: save_workbook elapsed=%.1fs", time.perf_counter() - phase_start)
 
     logging.info("Run completed in %.1fs", time.perf_counter() - run_start)
     return {
-        'final_path': final_path,
+        'workbook_path': workbook_path,
+        'final_report_path': build_final_report_path(workbook_path),
         'log_path': log_path,
+        'manual_input_items': manual_input_items,
         'revalidated_special_rows': revalidated_special_rows,
         'a07_rows_added': processing_results['a07_rows_added'],
         'payout_rows_added': processing_results['payout_rows_added'],
@@ -1135,8 +1218,12 @@ def run_fx_reconciliation(root, log_path=None):
     }
 
 
+def run_fx_reconciliation(root, log_path=None):
+    return prepare_fx_summary_workbook(root, log_path=log_path)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="FX Channel Settlement Automation Tool")
+    parser = argparse.ArgumentParser(description="Prepare the intermediate FX summary workbook.")
     parser.add_argument("directory", help="The root directory containing source files.")
 
     import sys
@@ -1147,7 +1234,7 @@ def main():
     args = parser.parse_args()
     root = args.directory
     try:
-        run_fx_reconciliation(root)
+        prepare_fx_summary_workbook(root)
     except Exception as e:
         logging.error(f"Initialization Failed: {e}")
         return

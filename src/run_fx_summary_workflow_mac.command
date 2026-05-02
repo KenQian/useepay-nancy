@@ -2,7 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PYTHON="$REPO_ROOT/venv/bin/python3"
 
 if [ -x "$VENV_PYTHON" ]; then
@@ -17,7 +17,7 @@ else
   exit 1
 fi
 
-"$PYTHON_CMD" "$SCRIPT_DIR/src/fx_reconciliation/fx_reconciliation_windows.py"
+"$PYTHON_CMD" "$REPO_ROOT/src/fx_summary_workflow/fx_summary_workflow_app.py"
 
 if [ $? -ne 0 ]; then
   echo
